@@ -53,6 +53,54 @@ class ThreadsafeRestrictionTrackerTest(unittest.TestCase):
     self.assertTrue(isinstance(deferred_time, timestamp.Duration))
     self.assertEqual(deferred_time, 0)
 
+  def test_defer_remainder_sets_optional_context_hook(self):
+    class _HookedOffsetRestrictionTracker(OffsetRestrictionTracker):
+      def __init__(self):
+        super().__init__(OffsetRange(0, 10))
+        self._in_defer_remainder_split = False
+        self.hook_values = []
+        self.try_split_hook_values = []
+
+      def _set_defer_remainder_split(self, active):
+        self._in_defer_remainder_split = active
+        self.hook_values.append(active)
+
+      def try_split(self, fraction_of_remainder):
+        self.try_split_hook_values.append(self._in_defer_remainder_split)
+        return super().try_split(fraction_of_remainder)
+
+    restriction_tracker = _HookedOffsetRestrictionTracker()
+    threadsafe_tracker = ThreadsafeRestrictionTracker(restriction_tracker)
+
+    threadsafe_tracker.defer_remainder()
+
+    self.assertEqual(restriction_tracker.hook_values, [True, False])
+    self.assertEqual(restriction_tracker.try_split_hook_values, [True])
+
+  def test_defer_remainder_ignores_non_callable_context_hook(self):
+    # A user-defined tracker may collide on the hook name with a non-callable
+    # attribute (e.g. an int sentinel) or expose a property that returns one.
+    # Either way ``defer_remainder`` must skip the hook instead of raising
+    # TypeError when it tries to call a non-callable.
+
+    class _AttrHookOffsetRestrictionTracker(OffsetRestrictionTracker):
+      _set_defer_remainder_split = True
+
+    class _PropertyHookOffsetRestrictionTracker(OffsetRestrictionTracker):
+      @property
+      def _set_defer_remainder_split(self):
+        return 'not-a-callable'
+
+    for cls in (_AttrHookOffsetRestrictionTracker,
+                _PropertyHookOffsetRestrictionTracker):
+      restriction_tracker = cls(OffsetRange(0, 10))
+      threadsafe_tracker = ThreadsafeRestrictionTracker(restriction_tracker)
+
+      threadsafe_tracker.defer_remainder()
+
+      deferred_residual, _ = threadsafe_tracker.deferred_status()
+      self.assertEqual(deferred_residual, OffsetRange(0, 10))
+
   def test_self_checkpoint_with_relative_time(self):
     threadsafe_tracker = ThreadsafeRestrictionTracker(
         OffsetRestrictionTracker(OffsetRange(0, 10)))

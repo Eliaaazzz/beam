@@ -66,6 +66,7 @@
 
 * Support for X source added (Java/Python) ([#X](https://github.com/apache/beam/issues/X)).
 * DebeziumIO (Java): added `OffsetRetainer` interface and `FileSystemOffsetRetainer` implementation to persist and restore CDC offsets across pipeline restarts, and exposed `withStartOffset` / `withOffsetRetainer` on `DebeziumIO.Read` and the cross-language `ReadBuilder` ([#28248](https://github.com/apache/beam/issues/28248)).
+* Added Python `UnboundedSource`, `UnboundedReader`, and `CheckpointMark` ABCs and an SDF-backed wrapper so `beam.io.Read(MyUnboundedSource())` dispatches through Splittable DoFn (mirrors Java `UnboundedSourceAsSDFWrapperFn`). Authors can now write custom streaming connectors in Python without hand-rolling a Splittable DoFn ([#19137](https://github.com/apache/beam/issues/19137)).
 
 ## New Features / Improvements
 

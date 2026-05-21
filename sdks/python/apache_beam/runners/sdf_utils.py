@@ -101,7 +101,17 @@ class ThreadsafeRestrictionTracker(object):
             'The timestamp of deter_remainder() should be a '
             'Duration or a Timestamp, or None.')
       self._deferred_timestamp = deferred_time
-      checkpoint = self.try_split(0)
+      set_defer_context = getattr(
+          self._restriction_tracker, '_set_defer_remainder_split', None)
+      if not callable(set_defer_context):
+        set_defer_context = None
+      if set_defer_context is not None:
+        set_defer_context(True)
+      try:
+        checkpoint = self.try_split(0)
+      finally:
+        if set_defer_context is not None:
+          set_defer_context(False)
       if checkpoint:
         _, self._deferred_residual = checkpoint
 
