@@ -21,13 +21,12 @@
 
 import unittest
 
-import mock
-
 import apache_beam as beam
-from apache_beam.io.concat_source import ConcatSource
-from apache_beam.io.concat_source_test import RangeSource
+import mock
 from apache_beam.io import iobase
 from apache_beam.io import range_trackers
+from apache_beam.io.concat_source import ConcatSource
+from apache_beam.io.concat_source_test import RangeSource
 from apache_beam.io.iobase import SourceBundle
 from apache_beam.options.pipeline_options import DebugOptions
 from apache_beam.testing.util import assert_that
@@ -225,7 +224,6 @@ class UseSdfUnboundedSourcesTests(unittest.TestCase):
   iobase.Read.expand(). Uses CountingSource from unbounded_source_test as the
   fake finite UnboundedSource (avoids dragging the network in).
   """
-
   def test_read_dispatches_to_read_from_unbounded_source(self):
     from apache_beam.io.unbounded_source_test import CountingSource
     with mock.patch(

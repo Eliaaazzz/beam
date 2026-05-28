@@ -340,7 +340,7 @@ class AbcContractTest(unittest.TestCase):
 class RestrictionCoderTest(unittest.TestCase):
   def test_roundtrip_no_checkpoint(self):
     source = CountingSource(3)
-    coder = _UnboundedSourceRestrictionCoder(source.get_checkpoint_mark_coder())
+    coder = _UnboundedSourceRestrictionCoder()
     decoded = coder.decode(
         coder.encode(_UnboundedSourceRestriction(source=source)))
     self.assertIsNone(decoded.checkpoint_mark)
@@ -352,7 +352,7 @@ class RestrictionCoderTest(unittest.TestCase):
 
   def test_roundtrip_with_checkpoint_resumes(self):
     source = CountingSource(5)
-    coder = _UnboundedSourceRestrictionCoder(source.get_checkpoint_mark_coder())
+    coder = _UnboundedSourceRestrictionCoder()
     restriction = _UnboundedSourceRestriction(
         source=source,
         checkpoint_mark=_CountingCheckpointMark(1),
@@ -382,13 +382,16 @@ class RestrictionProviderTest(unittest.TestCase):
         return [_NamedSource('a'), _NamedSource('b')]
 
     source = _NamedSource('root')
-    provider = _UnboundedSourceRestrictionProvider(options='opts')
+    provider = _UnboundedSourceRestrictionProvider()
     restriction = _UnboundedSourceRestriction(
         source=source, watermark=Timestamp(7))
 
     splits = list(provider.split(source, restriction))
 
-    self.assertEqual(split_log, [(20, 'opts')])
+    # The provider is a stateless module-level singleton, so it always
+    # passes ``None`` as the second arg to ``UnboundedSource.split``;
+    # forwarding PipelineOptions is W2 work (tracked under #19137).
+    self.assertEqual(split_log, [(20, None)])
     self.assertEqual([split.source.name for split in splits], ['a', 'b'])
     self.assertEqual([split.watermark for split in splits], [Timestamp(7)] * 2)
     self.assertTrue(all(split.checkpoint_mark is None for split in splits))
@@ -404,7 +407,7 @@ class RestrictionProviderTest(unittest.TestCase):
         return [self]
 
     source = _SplitSource(5)
-    provider = _UnboundedSourceRestrictionProvider(options='opts')
+    provider = _UnboundedSourceRestrictionProvider()
     restriction = _UnboundedSourceRestriction(
         source=source, checkpoint_mark=_CountingCheckpointMark(2))
 
