@@ -779,26 +779,29 @@ class ReadFromUnboundedSource(PTransform):
             _ReadFromUnboundedSourceDoFn(self._poll_interval_seconds)))
     # Wire the source's declared output coder onto the output PCollection.
     # Setting ``element_type`` alone is not enough: the runner derives the
-    # PCollection's coder via ``coder_registry.get_coder(element_type)``,
+    # PCollection's coder via ``coders.registry.get_coder(element_type)``,
     # which may resolve to a registry default that does NOT match the
     # source's declared coder (silently downgrading custom coders to pickle).
-    # Register against the pipeline-specific ``coder_registry`` rather than
-    # the global ``coders.registry`` so the registration does not leak
-    # across pipelines running in the same process.
+    # We register against the process-global ``coders.registry`` -- Beam's
+    # Python ``Pipeline`` has no pipeline-scoped coder registry today, so
+    # the global registry is the only available knob. This matches the
+    # pattern used for ``BoundedSource`` at iobase.py:938. The cross-
+    # pipeline side effect (registrations persist for the process lifetime
+    # and may affect concurrent pipelines that use the same element type)
+    # is a documented limitation tracked under #19137 W2.
     try:
       type_hint = output_coder.to_type_hint()
     except NotImplementedError:
       type_hint = None
     if type_hint is not None:
       try:
-        pbegin.pipeline.coder_registry.register_coder(
-            type_hint, type(output_coder))
+        coders.registry.register_coder(type_hint, type(output_coder))
       except Exception:  # pylint: disable=broad-except
         # Some coder classes refuse class-only registration (e.g. coders
         # parameterised by non-default constructor args). The element_type
         # below still flows through the registry's standard lookup; users
         # with parameterised coders must register their coder explicitly
-        # via ``pipeline.coder_registry.register_coder`` before pipeline
+        # via ``coders.registry.register_coder`` before pipeline
         # construction.
         _LOGGER.warning(
             'Could not register %s for element type %s; users must register '
