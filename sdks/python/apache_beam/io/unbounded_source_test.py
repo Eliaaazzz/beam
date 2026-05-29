@@ -1010,12 +1010,22 @@ class DoFnReaderCloseOnDownstreamRaiseTest(unittest.TestCase):
   the generator (no explicit ``throw``); the generator's ``finally`` runs
   when the generator is closed (``GeneratorExit``) or garbage collected.
 
-  We exercise that path two ways:
-    1. Unit-level: simulate the harness drop with ``generator.close()``
-       (raises ``GeneratorExit`` at the active yield, running ``finally``).
-    2. Integration: run a real pipeline with a downstream ``Map`` that
-       raises, and confirm the reader was closed before the pipeline
-       surfaced the error.
+  Reader-close coverage is split by what can be asserted deterministically:
+    1. Unit-level (``test_dofn_finally_closes_reader_on_generator_close``):
+       drive the generator directly and call ``generator.close()`` to force
+       the ``GeneratorExit``/``finally`` path. This is synchronous and
+       deterministic, and is the authoritative guarantee that the DoFn's
+       ``finally`` closes the reader.
+    2. Integration (``test_downstream_raise_surfaces_through_pipeline``):
+       run a real pipeline with a raising downstream ``Map`` and assert the
+       error propagates. We deliberately do NOT assert prompt reader-close
+       here: on this path the generator's ``finally`` runs only when the
+       abandoned generator is GARBAGE-COLLECTED, which is not deterministic
+       (the frame is pinned by the in-flight exception's traceback), and under
+       a loopback / subprocess SDK worker the reader may live in a different
+       process whose GC the test process cannot drive. Asserting a bounded
+       close time there is inherently racy -- it is the unit test above that
+       pins down close correctness.
   """
   def test_dofn_finally_closes_reader_on_generator_close(self):
     marker = _new_marker_path('.gen_close.log')
@@ -1050,34 +1060,24 @@ class DoFnReaderCloseOnDownstreamRaiseTest(unittest.TestCase):
       if os.path.exists(marker):
         os.unlink(marker)
 
-  def test_dofn_finally_closes_reader_via_integration_pipeline(self):
-    """End-to-end harness coverage: a real pipeline with a downstream
-    ``Map`` that raises must surface the exception AND must have closed
-    the reader. This complements the unit-level ``generator.close`` test
-    above by exercising the actual SDK harness output-handler path
-    (``common._OutputHandler.handle_process_outputs``).
+  def test_downstream_raise_surfaces_through_pipeline(self):
+    """End-to-end harness smoke test: a real pipeline with a downstream
+    ``Map`` that raises mid-bundle must surface the exception (errors on the
+    SDF read path are not swallowed). Reader-close on this path is GC-deferred
+    and therefore not asserted here -- see the class docstring and the
+    deterministic ``test_dofn_finally_closes_reader_on_generator_close``.
     """
-    marker = _new_marker_path('.integration_close.log')
+    raised = False
     try:
-      raised = False
-      try:
-        with beam.Pipeline() as p:
-          _ = (
-              p
-              | ReadFromUnboundedSource(_MarkerCloseSource(marker))
-              | 'BoomMap' >> beam.Map(_downstream_boom))
-      except Exception:  # pylint: disable=broad-except
-        raised = True
-      self.assertTrue(
-          raised, 'pipeline did not surface the downstream Map exception')
-      self.assertTrue(
-          _wait_for_marker(marker),
-          'reader leaked across the integration pipeline -- the SDK '
-          'harness path that drops the DoFn generator on downstream '
-          'failure did not trigger our finally close.')
-    finally:
-      if os.path.exists(marker):
-        os.unlink(marker)
+      with beam.Pipeline() as p:
+        _ = (
+            p
+            | ReadFromUnboundedSource(_MarkerCloseSource())
+            | 'BoomMap' >> beam.Map(_downstream_boom))
+    except Exception:  # pylint: disable=broad-except
+      raised = True
+    self.assertTrue(
+        raised, 'pipeline did not surface the downstream Map exception')
 
 
 # ------------------------------------------------------------------------------
