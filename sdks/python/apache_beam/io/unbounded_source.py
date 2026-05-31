@@ -15,60 +15,72 @@
 # limitations under the License.
 #
 
-"""A minimal, self-contained ``UnboundedSource`` for the Python SDK.
+"""Experimental ``UnboundedSource`` support for the Python SDK.
 
-This module is a Week-1 proof-of-concept for GSoC 2026 (issue #19137). It brings
-the Java ``UnboundedSource`` abstractions to Python and makes them *runnable* on
-the portable Fn API path (e.g. the default DirectRunner) by dispatching reads
-through a Splittable ``DoFn`` -- inspired by (not a literal port of) Java's
-``Read.UnboundedSourceAsSDFWrapperFn``. The streaming-SDF template followed for
-the process-loop / watermark / defer plumbing is
-``apache_beam.transforms.periodicsequence``.
+``UnboundedSource`` support is currently experimental in the Python SDK; the
+API may change in backwards-incompatible ways.
 
-Public API::
+An unbounded source reads an effectively infinite stream of records (message
+queues, change-data-capture feeds, and similar) with checkpoint-based
+pause/resume, watermark reporting, and bundle finalization.
 
+To define a source, implement :class:`UnboundedSource`, an
+:class:`UnboundedReader`, and (when the reader has a resumable position) a
+:class:`CheckpointMark`::
+
+    import apache_beam as beam
     from apache_beam.io.unbounded_source import (
-        UnboundedSource, UnboundedReader, CheckpointMark, ReadFromUnboundedSource)
+        CheckpointMark, UnboundedReader, UnboundedSource)
+    from apache_beam.utils.timestamp import MAX_TIMESTAMP
+
+    class MyCheckpointMark(CheckpointMark):
+      def __init__(self, position):
+        self.position = position
+
+      def finalize_checkpoint(self):
+        # Commit/acknowledge records up to ``position`` upstream, e.g. ack the
+        # consumed messages on a queue. Must be idempotent.
+        ...
+
+    class MyReader(UnboundedReader):
+      def start(self):
+        # Position at the first record; return whether one is available.
+        ...
+
+      def advance(self):
+        # Move to the next record; ``False`` means no data right now (not EOF).
+        ...
+
+      def get_current(self):
+        ...
+
+      def get_current_timestamp(self):
+        ...  # event time of the current record
+
+      def get_watermark(self):
+        # Lower bound on the timestamps of future records. Return
+        # ``MAX_TIMESTAMP`` to signal the reader has permanently finished.
+        ...
+
+      def get_checkpoint_mark(self):
+        return MyCheckpointMark(...)
 
     class MySource(UnboundedSource):
-      ...
+      def split(self, desired_num_splits, options=None):
+        # Return independent sub-sources, or ``[self]`` when not splittable.
+        return [self]
+
+      def create_reader(self, options, checkpoint_mark):
+        # Build a reader; resume after ``checkpoint_mark`` when it is not None.
+        return MyReader(...)
+
+      def get_checkpoint_mark_coder(self):
+        return ...  # a Coder for MyCheckpointMark
+
+Read the source in a pipeline with :class:`apache_beam.io.Read`::
 
     with beam.Pipeline() as p:
-      p | ReadFromUnboundedSource(MySource()) | beam.Map(print)
-      # Equivalent (since iobase.Read.expand dispatches on source type):
-      # p | beam.io.Read(MySource()) | beam.Map(print)
-
-Scope (deliberately minimal): read loop, event-time timestamps, monotonic
-watermark reporting (including the EOF advance to ``MAX_TIMESTAMP`` so downstream
-windows can close), checkpoint-based pause/resume (``defer_remainder``),
-deterministic reader close on EOF / split / exception, and bundle finalization.
-
-Out of scope for this PoC (tracked under #19137):
-  * Per-bundle read bound. ``process()`` reads every record the reader makes
-    available and only yields control on a no-data poll (self-checkpoint) or
-    EOF. A genuinely saturated source that always has data will therefore
-    keep one bundle running indefinitely -- the watermark advances on the
-    in-bundle estimator but is not committed downstream, and no checkpoint /
-    finalize is cut, until the source idles. Java bounds each SDF call via
-    ``OutputAndTimeBoundedSplittableProcessElementInvoker`` (a max element
-    count / wall-clock per invocation); the equivalent forced-defer is W2
-    work. Self-terminating finite sources (and any source that periodically
-    returns no-data) are unaffected.
-  * Record-id-based deduplication (Java's ``ValueWithRecordId``).
-  * Backlog-byte reporting (``restriction_size`` is a constant 1; per-restriction
-    progress is binary 0.0 / 1.0).
-  * Dynamic split fractions / runner-initiated work stealing.
-  * Initial fan-out uses a fixed default split count (20), matching Java's
-    wrapper default. There is no public Python SDF hook to pass a runner-chosen
-    desired split count yet.
-  * Source-specific checkpoint coders threaded through the SDF restriction coder
-    (the restriction coder always pickles checkpoint marks via the source's
-    ``get_checkpoint_mark_coder`` captured once at ``expand()`` time, but no
-    per-tracker coder dispatch).
-  * Reader caching across bundles (Java caches readers across split boundaries
-    via a Guava cache; this PoC always rebuilds the reader from the checkpoint).
-  * ``EmptyUnboundedSource`` terminal-state marker (this PoC uses an ``is_done``
-    flag on the restriction instead).
+      p | beam.io.Read(MySource()) | beam.Map(print)
 """
 
 # pytype: skip-file
@@ -91,7 +103,6 @@ from apache_beam.coders.coders import _MemoizingPickleCoder
 from apache_beam.io import iobase
 from apache_beam.io.watermark_estimators import ManualWatermarkEstimator
 from apache_beam.runners import sdf_utils
-from apache_beam.transforms import Impulse
 from apache_beam.transforms import PTransform
 from apache_beam.transforms import core
 from apache_beam.transforms.window import TimestampedValue
@@ -109,48 +120,34 @@ __all__ = [
 
 _LOGGER = logging.getLogger(__name__)
 
-# Placed in the ``try_claim`` holder when the reader has no data *right now*.
-# This is NOT end-of-stream -- an unbounded reader may produce more later.
+# Holder sentinel for "no data right now" (distinct from end-of-stream).
 _NO_DATA = object()
 
 _DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 _DEFAULT_DESIRED_NUM_SPLITS = 20
 
 # ------------------------------------------------------------------------------
-# Public abstract base classes (Java semantics, Python names). Following the
-# existing iobase.py style, methods raise NotImplementedError rather than using
-# a formal abc.ABC.
+# Public abstract base classes (NotImplementedError rather than abc.ABC, per
+# iobase.py style).
 # ------------------------------------------------------------------------------
 
 
 class CheckpointMark(object):
   """A durable, serializable position in an :class:`UnboundedSource`.
 
-  Mirrors ``org.apache.beam.sdk.io.UnboundedSource.CheckpointMark``. Produced by
-  :meth:`UnboundedReader.get_checkpoint_mark`, encoded with
+  Produced by :meth:`UnboundedReader.get_checkpoint_mark`, encoded with
   :meth:`UnboundedSource.get_checkpoint_mark_coder`, and used to resume a reader
   (see :meth:`UnboundedSource.create_reader`).
   """
   def finalize_checkpoint(self) -> None:
     """Called once the runner has durably committed work up to this mark.
 
-    Override to acknowledge/commit upstream (e.g. ack Pub/Sub messages). The
-    default is a no-op. Unlike Java, the Python bundle finalizer takes no
-    deadline argument, so no mapping is required here.
+    Override to acknowledge/commit upstream (for example, ack the consumed
+    messages on a queue). The default is a no-op.
 
-    Implementations MUST be idempotent in two senses:
-      * Repeated calls on the same :class:`CheckpointMark` instance must be
-        safe (runner may retry callbacks).
-      * Successive calls on *different* CheckpointMark instances must be
-        consistent with monotonically progressing committed state (each
-        bundle's defer/split produces a fresh CheckpointMark covering the
-        records read so far; the typical Kafka-style implementation is
-        ``ack(self.last_offset)`` which is naturally monotonic and idempotent
-        on the broker side).
-
-    The SDK's bundle finalizer (``_BundleFinalizerParam.finalize_bundle`` at
-    ``transforms/core.py``) catches and logs any exception raised from this
-    method but does NOT retry, so a transient failure is silently dropped.
+    Implementations must be idempotent: the runner may retry the callback on
+    the same mark, and each bundle produces a fresh mark covering the records
+    read so far. An exception raised here is logged but not retried.
     """
     pass
 
@@ -158,12 +155,11 @@ class CheckpointMark(object):
 class UnboundedReader(object):
   """Reads records from an :class:`UnboundedSource`.
 
-  Mirrors ``UnboundedSource.UnboundedReader``. Lifecycle: exactly one
-  :meth:`start`, then any number of :meth:`advance` calls; whenever one returns
-  ``True`` the current record is available via :meth:`get_current` /
-  :meth:`get_current_timestamp`. A ``False`` return means "no data available
-  right now", which is distinct from end-of-stream: a reader signals a permanent
-  end by reporting a watermark of ``MAX_TIMESTAMP``.
+  Lifecycle: exactly one :meth:`start`, then any number of :meth:`advance`
+  calls; whenever one returns ``True`` the current record is available via
+  :meth:`get_current` / :meth:`get_current_timestamp`. A ``False`` return means
+  "no data available right now", which is distinct from end-of-stream: a reader
+  signals a permanent end by reporting a watermark of ``MAX_TIMESTAMP``.
   """
   def start(self) -> bool:
     """Positions at the first record; returns whether one is available."""
@@ -201,23 +197,20 @@ class UnboundedReader(object):
 class UnboundedSource(iobase.SourceBase):
   """A source producing an unbounded stream of records with checkpointing.
 
-  Mirrors ``org.apache.beam.sdk.io.UnboundedSource``. Read it in a pipeline with
-  :class:`ReadFromUnboundedSource`::
+  Read it in a pipeline with :class:`apache_beam.io.Read`::
 
-      p | ReadFromUnboundedSource(MyUnboundedSource())
+      p | beam.io.Read(MyUnboundedSource())
   """
   def split(self,
             desired_num_splits: int,
             options: Optional[Any] = None) -> Iterable['UnboundedSource']:
     """Splits into at most ``desired_num_splits`` independent sub-sources.
 
-    Each returned sub-source MUST be independent and MUST NOT share mutable
+    Each returned sub-source must be independent and must not share mutable
     state with siblings (the runner may execute them concurrently across
-    workers). Mirrors Java's ``UnboundedSource.split``. Note that the current
-    ``ReadFromUnboundedSource`` calls this during initial SDF splitting with a
-    fixed default desired split count. Dynamic re-splitting of the source itself
-    remains out of scope; once a checkpoint exists the wrapper keeps that
-    restriction intact.
+    workers). Return ``[self]`` if the source cannot be split. Splitting is
+    performed once, before any checkpoint exists; once a reader has
+    checkpointed, the restriction is kept intact.
     """
     raise NotImplementedError
 
@@ -233,8 +226,7 @@ class UnboundedSource(iobase.SourceBase):
       * When ``checkpoint_mark`` is not ``None``, the returned reader's
         ``start()`` produces the FIRST record strictly AFTER the position
         encoded by ``checkpoint_mark``. The reader must NOT re-deliver records
-        already covered by the prior bundle. Mirrors Java's
-        ``UnboundedSource.createReader(options, checkpointMark)``.
+        already covered by the prior bundle.
     """
     raise NotImplementedError
 
@@ -254,16 +246,13 @@ class UnboundedSource(iobase.SourceBase):
     return False
 
   def default_output_coder(self) -> Coder:
-    # Permissive default, matching BoundedSource (iobase.py). Override for a
-    # tighter coder. ReadFromUnboundedSource uses this coder when inferring the
-    # output PCollection type/coder.
+    # Permissive default; override for a tighter coder.
     return coders.registry.get_coder(object)
 
 
 # ------------------------------------------------------------------------------
-# SDF wrapper internals (restriction, coder, tracker, provider). Names are
-# underscore-prefixed: they are an implementation detail of
-# ReadFromUnboundedSource, not public API.
+# SDF wrapper internals: a private implementation detail of
+# ReadFromUnboundedSource.
 # ------------------------------------------------------------------------------
 
 
@@ -271,22 +260,19 @@ class UnboundedSource(iobase.SourceBase):
 class _UnboundedSourceRestriction(object):
   """Durable SDF restriction describing where a reader should (re)start.
 
-  Holds only serializable state -- never a live reader. Mirrors Java's
-  ``UnboundedSourceRestriction(source, checkpoint, watermark)`` plus an explicit
-  ``is_done`` flag for the terminal (MAX-watermark) transition and a separate
-  ``finalization_checkpoint_mark`` so a done primary can carry a commit-hook
-  without polluting the RESUME-state ``checkpoint_mark`` (matches W1 design
-  doc v5 finding: combining the two channels causes resume/commit semantic
-  confusion).
+  Holds only serializable state -- never a live reader. ``is_done`` marks the
+  terminal (MAX-watermark) transition. ``finalization_checkpoint_mark`` is kept
+  separate from ``checkpoint_mark`` so a done primary can carry a commit hook
+  without polluting the resume state.
 
   Field roles:
     * ``checkpoint_mark`` -- RESUME state. A reader rebuilt from this mark
       MUST produce the FIRST record strictly AFTER it (i.e. no re-delivery).
     * ``finalization_checkpoint_mark`` -- COMMIT hook. Only set on a done
       primary that was just cut this bundle. Registered with the runner's
-      bundle finalizer to acknowledge upstream (e.g. ack Pub/Sub messages).
-      Independent of ``checkpoint_mark`` so a residual's resume state can be
-      ``None`` while still recording what should be acked.
+      bundle finalizer to acknowledge upstream. Independent of
+      ``checkpoint_mark`` so a residual's resume state can be ``None`` while
+      still recording what should be committed.
   """
   source: UnboundedSource
   checkpoint_mark: Optional[CheckpointMark] = None
@@ -348,12 +334,7 @@ class _UnboundedSourceRestrictionCoder(Coder):
         finalization_checkpoint_mark=cp_coder.decode(finalization_bytes))
 
   def is_deterministic(self) -> bool:
-    # The source and checkpoint are pickled, which is not guaranteed
-    # deterministic; matches the bounded SDF restriction coder in iobase.py.
-    # NOTE on forward-compat: the wire format is a fixed 5-tuple. Adding a
-    # 6th field in a future version would break decoding of in-flight blobs
-    # from older workers. If/when another field is needed, switch this to a
-    # length-prefixed or version-tagged encoding -- out of scope for W1.
+    # Pickled source and checkpoint are not guaranteed deterministic.
     return False
 
 
@@ -361,14 +342,13 @@ class _UnboundedSourceRestrictionTracker(iobase.RestrictionTracker):
   """Drives an :class:`UnboundedReader` for one SDF restriction.
 
   Owns the live reader (lazily created, never serialized): both runner-initiated
-  ``try_split`` and the self-checkpoint ``try_split(0)`` raised by
-  ``defer_remainder`` must checkpoint the *same* reader.
+  ``defer_remainder`` self-checkpoints with ``try_split(0)``, which must
+  checkpoint the live reader.
 
-  ``process()`` only ever sees a ``RestrictionTrackerView`` -- which hides custom
-  methods and whose ``try_claim`` returns just a bool -- so the freshly-read
+  ``process()`` only sees a ``RestrictionTrackerView``, which hides custom
+  methods and whose ``try_claim`` returns just a bool, so the freshly-read
   record is handed back through a one-element holder list passed as the
-  ``try_claim`` *position* argument (mirrors Java's
-  ``tryClaim(UnboundedSourceValue[] out)``).
+  ``try_claim`` *position* argument.
   """
   def __init__(
       self,
@@ -379,9 +359,6 @@ class _UnboundedSourceRestrictionTracker(iobase.RestrictionTracker):
     self._reader = None  # type: Optional[UnboundedReader]
     self._started = False
     # True once a checkpoint has been cut this bundle (EOF or self-checkpoint).
-    # Today this co-varies with `_restriction.is_done` (both set together at
-    # EOF and at try_split); kept separate as a forward-compat hook so a
-    # future refactor can checkpoint without finishing the restriction.
     self._checkpoint_taken = False
 
   def _ensure_reader(self) -> None:
@@ -407,40 +384,20 @@ class _UnboundedSourceRestrictionTracker(iobase.RestrictionTracker):
     return self._restriction
 
   def try_claim(self, out: List[Any]) -> bool:
-    """Advances the underlying reader by one record.
+    """Advances the reader by one record.
 
-    Holder protocol: ``out[0]`` receives either
-    ``(value, record_timestamp, source_watermark)`` on the has-data path, or
-    the :data:`_NO_DATA` sentinel on no-data-now / EOF / already-done paths.
-
-    The watermark in the has-data tuple is the SOURCE'S reported watermark
-    (``reader.get_watermark()``), not the record's event time -- matching
-    Java's ``UnboundedSourceValue.getWatermark()`` (Read.java:594). The
-    DoFn uses ``source_watermark`` to advance the output PCollection's
-    watermark and uses ``record_timestamp`` only to label the emitted
-    ``TimestampedValue``. Conflating the two would freeze the PCollection
-    watermark at the last record's event time, breaking out-of-order
-    sources and starving downstream event-time windows.
-
-    Contract drift note: the ``RestrictionTracker`` ABC defines
-    ``try_claim(position)`` where ``position`` identifies a split point. We
-    instead use the argument as a one-element output holder, like Java's
-    ``tryClaim(UnboundedSourceValue[] out)``. The
-    ``ThreadsafeRestrictionTracker`` / ``RestrictionTrackerView`` chain
-    forwards the value opaquely (sdf_utils.py:75, sdf_utils.py:171), so the
-    mutation is visible across the lock.
-
-    Exception safety: any exception from ``reader.start()`` / ``advance()`` /
-    ``get_watermark()`` etc. closes the reader before re-raising, so the
-    DoFn's ``finally`` does not need to traverse the SDF wrapper chain on
-    reader-method failures.
+    ``out[0]`` receives ``(value, record_timestamp, source_watermark)`` on the
+    has-data path, or the :data:`_NO_DATA` sentinel otherwise. The watermark is
+    the source's reported watermark, not the record's event time: the DoFn
+    advances the output watermark with the former and timestamps the record
+    with the latter. The argument doubles as the output holder (the
+    ``RestrictionTracker`` ABC treats it as a claim position), which the
+    threadsafe-tracker chain forwards opaquely.
     """
     try:
       return self._try_claim_inner(out)
     except Exception:
-      # Reader is in an indeterminate state; release its resources before
-      # the exception bubbles to the DoFn (which can't trust ``self._reader``
-      # anymore).
+      # Reader state is now indeterminate; release it before re-raising.
       self._close_reader_if_open()
       raise
 
@@ -455,12 +412,9 @@ class _UnboundedSourceRestrictionTracker(iobase.RestrictionTracker):
       has_data = self._reader.advance()
     self._started = True
     if has_data:
-      # A record is available: always emit it. Inspect has_data BEFORE the
-      # watermark, because a reader may return its final record and report a
-      # MAX_TIMESTAMP watermark on the *same* call (meaning "nothing after
-      # this"). That EOF is realized on the next, data-less claim, so the
-      # record we just read is never dropped. Capture the source watermark
-      # alongside the record (see method docstring for why).
+      # Emit an available record before checking the watermark: a reader may
+      # report its last record and a MAX_TIMESTAMP watermark on the same call,
+      # and EOF is realized on the next data-less claim.
       out[0] = (
           self._reader.get_current(),
           self._reader.get_current_timestamp(),
@@ -468,8 +422,7 @@ class _UnboundedSourceRestrictionTracker(iobase.RestrictionTracker):
       return True
     watermark = self._reader.get_watermark()
     if watermark >= MAX_TIMESTAMP:
-      # No data and watermark at MAX: the reader permanently finished. Cut a
-      # final checkpoint, close, and mark the restriction done.
+      # No data and watermark at MAX: cut a final checkpoint, close, mark done.
       checkpoint = self._reader.get_checkpoint_mark()
       self._close_reader_if_open()
       self._restriction = dataclasses.replace(
@@ -510,23 +463,21 @@ class _UnboundedSourceRestrictionTracker(iobase.RestrictionTracker):
       raise
 
   def _try_split_inner(self, fraction_of_remainder):
-    # fraction 0 is the self-checkpoint raised by defer_remainder(); any other
-    # fraction cuts the same checkpoint. Returns (primary, residual) or None.
+    # Only self-checkpoint (fraction 0) is supported; decline runner-initiated
+    # dynamic splits.
+    if fraction_of_remainder != 0:
+      return None
     if self._reader is None or not self._started or self._restriction.is_done:
       return None
     checkpoint = self._reader.get_checkpoint_mark()
     watermark = self._reader.get_watermark()
-    # Primary represents work just finished THIS bundle; it carries ONLY the
-    # finalize hook. checkpoint_mark on primary is None to make it obvious
-    # that the primary has no resume state of its own.
+    # Keep the two channels independent: the primary carries only the finalize
+    # hook, the residual only the resume state.
     primary = dataclasses.replace(
         self._restriction,
         checkpoint_mark=None,
         is_done=True,
         finalization_checkpoint_mark=checkpoint)
-    # Residual represents future work; it carries ONLY the resume state.
-    # finalization_checkpoint_mark is None so a future bundle does not
-    # double-register finalize for the same checkpoint.
     residual = _UnboundedSourceRestriction(
         source=self._restriction.source,
         checkpoint_mark=checkpoint,
@@ -535,8 +486,7 @@ class _UnboundedSourceRestrictionTracker(iobase.RestrictionTracker):
         finalization_checkpoint_mark=None)
     self._restriction = primary
     self._checkpoint_taken = True
-    # The residual's reader is rebuilt from its checkpoint on resume; close
-    # ours rather than dropping a live handle on the floor.
+    # The residual rebuilds its reader from the checkpoint on resume.
     self._close_reader_if_open()
     return primary, residual
 
@@ -550,11 +500,8 @@ class _UnboundedSourceRestrictionTracker(iobase.RestrictionTracker):
         '%r' % (self._restriction, ))
 
   def current_progress(self) -> 'iobase.RestrictionProgress':
-    # Backlog-based progress is out of scope; report a coarse done/not-done
-    # signal so the runner has a (recommended) signal. Use ``completed`` /
-    # ``remaining`` rather than ``fraction`` so downstream consumers that
-    # read ``RestrictionProgress.completed_work`` / ``remaining_work`` see
-    # the expected values directly.
+    # Backlog-based progress is not implemented; report a coarse done/not-done
+    # signal via ``completed`` / ``remaining``.
     if self._restriction.is_done:
       return iobase.RestrictionProgress(completed=1.0, remaining=0.0)
     return iobase.RestrictionProgress(completed=0.0, remaining=1.0)
@@ -569,10 +516,10 @@ class _UnboundedSourceRestrictionProvider(core.RestrictionProvider):
   Stateless module-level singleton (see :data:`_PROVIDER`): all
   source-specific state (e.g. the source's checkpoint coder) is derived
   per-call from the restriction's ``source`` field, which lets
-  :class:`_ReadFromUnboundedSourceDoFn` live at module level too --
-  avoiding stdlib-pickle gotchas for closure-defined DoFns. PipelineOptions
-  forwarded to ``UnboundedSource.split`` are W2 work; today the provider
-  always passes ``None``.
+  :class:`_ReadFromUnboundedSourceDoFn` live at module level too -- avoiding
+  stdlib-pickle gotchas for closure-defined DoFns. The provider currently
+  passes ``None`` for the ``options`` forwarded to
+  :meth:`UnboundedSource.split`.
   """
   def __init__(self):
     self._restriction_coder = _UnboundedSourceRestrictionCoder()
@@ -596,10 +543,8 @@ class _UnboundedSourceRestrictionProvider(core.RestrictionProvider):
       yield restriction
       return
 
-    # Only catch errors raised BY ``source.split`` -- that path is user code
-    # and may legitimately refuse to split (network glitch, partition fetch
-    # error, etc.). Falling back to a single restriction matches Java's
-    # ``BoundedSourceAsSDF`` behaviour.
+    # ``source.split`` is user code and may refuse to split; fall back to a
+    # single restriction on error.
     try:
       split_sources = list(
           restriction.source.split(_DEFAULT_DESIRED_NUM_SPLITS, None))
@@ -614,10 +559,8 @@ class _UnboundedSourceRestrictionProvider(core.RestrictionProvider):
       yield restriction
       return
 
-    # Validation lives OUTSIDE the try/except above. A non-UnboundedSource
-    # returned from ``source.split`` is a source-contract violation, not a
-    # split-refusal, and must fail loudly rather than silently running
-    # single-shard.
+    # A non-UnboundedSource split result is a contract violation, not a
+    # refusal, so fail loudly (outside the try/except above).
     for split_source in split_sources:
       if not isinstance(split_source, UnboundedSource):
         raise TypeError(
@@ -633,36 +576,30 @@ class _UnboundedSourceRestrictionProvider(core.RestrictionProvider):
           finalization_checkpoint_mark=None)
 
   def restriction_size(self, element, restriction) -> int:
-    # Backlog estimation is out of scope; report a constant non-negative size.
-    # This blinds Dataflow's auto-scaler and Flink's work-stealing to per-
-    # restriction load -- documented gap for #19137.
+    # TODO(https://github.com/apache/beam/issues/19137): implement backlog
+    # estimation.
     return 1
 
   def restriction_coder(self) -> Coder:
     return self._restriction_coder
 
   def truncate(self, element, restriction):
-    # On drain, stop emitting new records (mirrors PeriodicSequence.truncate).
+    # On drain, stop emitting new records.
     return None
 
 
-# Module-level singleton -- the SDF framework captures this via
-# ``RestrictionParam`` at class-def time of :class:`_ReadFromUnboundedSourceDoFn`.
-# Stateless by design (see provider docstring).
+# Module-level stateless singleton, captured via ``RestrictionParam`` at the
+# DoFn's class-definition time.
 _PROVIDER = _UnboundedSourceRestrictionProvider()
 
 
 class _ReadFromUnboundedSourceDoFn(core.DoFn):
   """SDF wrapper driving an :class:`UnboundedReader` for one restriction.
 
-  Module-level (not nested inside ``ReadFromUnboundedSource.expand``) so
-  stdlib ``pickle`` -- not just cloudpickle -- can serialise the DoFn. The
-  per-pipeline ``poll_interval_seconds`` is passed via ``__init__``; the
-  restriction provider is the module-level :data:`_PROVIDER` singleton.
+  Module-level (not nested inside ``ReadFromUnboundedSource.expand``) so stdlib
+  ``pickle`` -- not just cloudpickle -- can serialise the DoFn. The restriction
+  provider is the module-level :data:`_PROVIDER` singleton.
   """
-  def __init__(self, poll_interval_seconds: float):
-    self._poll_interval_seconds = poll_interval_seconds
-
   @core.DoFn.unbounded_per_element()
   def process(
       self,
@@ -671,58 +608,43 @@ class _ReadFromUnboundedSourceDoFn(core.DoFn):
       tracker=core.DoFn.RestrictionParam(_PROVIDER),
       watermark_estimator=core.DoFn.WatermarkEstimatorParam(
           ManualWatermarkEstimator.default_provider())):
-    # Parameter order matters: positionally-injected params (the element and
-    # the bundle finalizer) must precede the kwarg-injected ones (the
-    # restriction tracker and watermark estimator), which the SDF invoker
-    # passes by name (runners/common.py _get_arg_placeholders).
+    # Positional params (element, bundle finalizer) must precede the
+    # kwarg-injected ones (tracker, watermark estimator).
     assert isinstance(tracker, sdf_utils.RestrictionTrackerView)
     initial = tracker.current_restriction()
     try:
       while True:
         holder = [None]
         if not tracker.try_claim(holder):
-          # EOF (restriction is_done==True, watermark already set to MAX in
-          # the tracker). Mirrors Java Read.java:625 -- advance the
-          # watermark estimator unconditionally on the terminal path so
-          # downstream event-time windows can close, otherwise the
-          # estimator would stay at the last reported watermark.
+          # EOF: advance the estimator to the tracker's MAX watermark so
+          # downstream event-time windows can close.
           _set_watermark_if_greater(
               watermark_estimator, tracker.current_restriction().watermark)
           break
         record = holder[0]
         if record is _NO_DATA:
           # No data right now: advance the watermark and self-checkpoint so
-          # the runner reschedules us later. Resume via defer_remainder() +
-          # break -- NOT yield ProcessContinuation (the portable SDF path).
+          # the runner reschedules us after a short delay.
           _set_watermark_if_greater(
               watermark_estimator, tracker.current_restriction().watermark)
-          tracker.defer_remainder(Duration(seconds=self._poll_interval_seconds))
+          tracker.defer_remainder(
+              Duration(seconds=_DEFAULT_POLL_INTERVAL_SECONDS))
           break
-        # Data path: advance the estimator with the SOURCE's reported
-        # watermark (third tuple slot), NOT the record's event time.
-        # Mirrors Java Read.java:594. The record's event time is used
-        # only as the TimestampedValue label so the downstream sees the
-        # real per-record timestamp.
+        # Advance the estimator with the source watermark (third slot), not
+        # the record's event time.
         value, record_timestamp, source_watermark = record
         _set_watermark_if_greater(watermark_estimator, source_watermark)
         yield TimestampedValue(value, record_timestamp)
     finally:
       current = tracker.current_restriction()
-      # Register finalization only when a real checkpoint was cut this
-      # bundle. Restriction identity (``current is not initial``) mirrors
-      # Java's reference-equality gate in Read.java. We read the explicit
-      # finalization channel, NOT ``checkpoint_mark`` (which is the RESUME
-      # state and may belong to the residual after a split).
+      # Register finalization only when a checkpoint was cut this bundle (the
+      # restriction identity changed), reading the explicit finalize channel.
       finalize_mark = current.finalization_checkpoint_mark
       if current is not initial and finalize_mark is not None:
         bundle_finalizer.register(finalize_mark.finalize_checkpoint)
-      # Release the underlying reader on every exit path, including the
-      # exception path where a downstream yield raised between two
-      # try_claim calls (reader-method failures are already closed inside
-      # the tracker). ``RestrictionTrackerView`` does not expose the inner
-      # tracker, so we unwrap dynamically: each layer is optional, so a
-      # future wrapper-chain change degrades gracefully rather than
-      # crashing the bundle.
+      # Best-effort reader release for the downstream-yield-raised path (the
+      # tracker already closes on EOF, split, and reader-method failures),
+      # reached through the wrapper chain since the view hides the tracker.
       inner_tracker = tracker
       if hasattr(inner_tracker, '_threadsafe_restriction_tracker'):
         inner_tracker = inner_tracker._threadsafe_restriction_tracker
@@ -730,20 +652,19 @@ class _ReadFromUnboundedSourceDoFn(core.DoFn):
         inner_tracker = inner_tracker._restriction_tracker
       if isinstance(inner_tracker, _UnboundedSourceRestrictionTracker):
         inner_tracker._close_reader_if_open()
-      elif inner_tracker is not tracker:
+      else:
         _LOGGER.warning(
-            'UnboundedSource DoFn could not reach an inner tracker of type '
-            '_UnboundedSourceRestrictionTracker via the SDF wrapper chain; '
-            'reader close on exception path skipped, relying on GC. Beam '
-            'SDF wrapper internals may have changed -- file an issue.')
+            'UnboundedSource DoFn could not close a reader because the SDF '
+            'tracker wrapper did not expose _UnboundedSourceRestrictionTracker '
+            '(got %s). Reader resources may remain open until garbage '
+            'collection.',
+            type(inner_tracker).__name__)
 
 
 def _set_watermark_if_greater(
     watermark_estimator, new_watermark: Timestamp) -> None:
-  # ManualWatermarkEstimator.set_watermark raises if the watermark regresses, so
-  # only ever advance it (mirrors PeriodicSequence's monotonic guard). A
-  # misbehaving reader that reports a regressing watermark is silently absorbed
-  # here -- intentional, to keep the pipeline running through reader bugs.
+  # ManualWatermarkEstimator.set_watermark raises on regression, so only ever
+  # advance it (a regressing reader watermark is absorbed here).
   current = watermark_estimator.current_watermark()
   if current is None or new_watermark > current:
     watermark_estimator.set_watermark(new_watermark)
@@ -752,74 +673,42 @@ def _set_watermark_if_greater(
 class ReadFromUnboundedSource(PTransform):
   """Reads an :class:`UnboundedSource` via a Splittable ``DoFn``.
 
-  Dispatches through an SDF that mirrors Java's
-  ``Read.UnboundedSourceAsSDFWrapperFn``: checkpoint-based pause/resume
-  (``defer_remainder``), monotonic watermark reporting, and bundle finalization.
-  Runs on the portable Fn API path -- the default DirectRunner routes an
-  ``Impulse | Map | ParDo`` pipeline to Prism/FnApiRunner::
+  Most users should prefer :class:`apache_beam.io.Read`, which dispatches an
+  ``UnboundedSource`` here automatically::
 
-      p | ReadFromUnboundedSource(MyUnboundedSource())
+      p | beam.io.Read(MyUnboundedSource())
   """
-  def __init__(
-      self,
-      source: UnboundedSource,
-      poll_interval_seconds: float = _DEFAULT_POLL_INTERVAL_SECONDS):
+  def __init__(self, source: UnboundedSource):
     if not isinstance(source, UnboundedSource):
       raise TypeError('source must be an UnboundedSource, got %r' % (source, ))
-    if poll_interval_seconds <= 0:
-      # A zero / negative poll interval would either busy-spin on no-data
-      # polls (poll_interval=0 -> defer_remainder(Duration(0)) -> immediate
-      # re-schedule) or pass a negative ``Duration`` to the runner which is
-      # not well-defined. Mirror Java's IllegalArgumentException posture.
-      raise ValueError(
-          'poll_interval_seconds must be > 0, got %r' %
-          (poll_interval_seconds, ))
     super().__init__()
     self._source = source
-    self._poll_interval_seconds = poll_interval_seconds
 
   def expand(self, pbegin):
     source = self._source
     output_coder = source.default_output_coder()
     output = (
         pbegin
-        | 'Impulse' >> Impulse()
-        | 'EmitSource' >> core.Map(lambda _: source)
-        | 'ReadUnbounded' >> core.ParDo(
-            _ReadFromUnboundedSourceDoFn(self._poll_interval_seconds)))
-    # Wire the source's declared output coder onto the output PCollection.
-    # Setting ``element_type`` alone is not enough: the runner derives the
-    # PCollection's coder via ``coders.registry.get_coder(element_type)``,
-    # which may resolve to a registry default that does NOT match the
-    # source's declared coder (silently downgrading custom coders to pickle).
-    # We register against the process-global ``coders.registry`` -- Beam's
-    # Python ``Pipeline`` has no pipeline-scoped coder registry today, so
-    # the global registry is the only available knob. This matches the
-    # pattern used for ``BoundedSource`` at iobase.py:938. The cross-
-    # pipeline side effect (registrations persist for the process lifetime
-    # and may affect concurrent pipelines that use the same element type)
-    # is a documented limitation tracked under #19137 W2.
+        | 'Create' >> core.Create([source])
+        | 'ReadUnbounded' >> core.ParDo(_ReadFromUnboundedSourceDoFn()))
+    # Surface an element type only when the global registry already maps it to
+    # an equivalent coder; we don't mutate ``coders.registry`` (can't register a
+    # parameterized coder by class without leaking/losing state).
     try:
       type_hint = output_coder.to_type_hint()
     except NotImplementedError:
       type_hint = None
     if type_hint is not None:
       try:
-        coders.registry.register_coder(type_hint, type(output_coder))
+        registered_coder = coders.registry.get_coder(type_hint)
       except Exception:  # pylint: disable=broad-except
-        # Some coder classes refuse class-only registration (e.g. coders
-        # parameterised by non-default constructor args). The element_type
-        # below still flows through the registry's standard lookup; users
-        # with parameterised coders must register their coder explicitly
-        # via ``coders.registry.register_coder`` before pipeline
-        # construction.
         _LOGGER.warning(
-            'Could not register %s for element type %s; users must register '
-            'their coder explicitly for non-default coders.',
-            type(output_coder).__name__,
+            'Could not look up the registered coder for element type %s.',
             type_hint,
             exc_info=True)
-      output.element_type = type_hint
+      else:
+        if registered_coder == output_coder:
+          output.element_type = type_hint
     return output
 
   def _infer_output_coder(self, input_type=None, input_coder=None):
