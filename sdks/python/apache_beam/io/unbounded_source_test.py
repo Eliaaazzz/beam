@@ -214,17 +214,21 @@ class _PrefixStrCoder(coders.Coder):
   def __init__(self, prefix):
     self._prefix = prefix
 
+  @override
   def encode(self, value):
     if not value.startswith(self._prefix):
       raise ValueError('expected %r prefix' % self._prefix)
     return value[len(self._prefix):].encode('utf-8')
 
+  @override
   def decode(self, value):
     return self._prefix + value.decode('utf-8')
 
+  @override
   def is_deterministic(self):
     return True
 
+  @override
   def to_type_hint(self):
     return str
 

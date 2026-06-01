@@ -89,9 +89,7 @@ import dataclasses
 import logging
 from typing import Any
 from typing import Iterable
-from typing import List
 from typing import Optional
-from typing import Tuple
 
 from apache_beam import coders
 from apache_beam.coders.coders import BooleanCoder
@@ -120,15 +118,15 @@ __all__ = [
 
 _LOGGER = logging.getLogger(__name__)
 
-# Holder sentinel for "no data right now" (distinct from end-of-stream).
+# Sentinel used when a reader has no data available right now.
+# This is distinct from end-of-stream.
 _NO_DATA = object()
 
 _DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 _DEFAULT_DESIRED_NUM_SPLITS = 20
 
 # ------------------------------------------------------------------------------
-# Public abstract base classes (NotImplementedError rather than abc.ABC, per
-# iobase.py style).
+# Public abstract base classes.
 # ------------------------------------------------------------------------------
 
 
@@ -233,9 +231,9 @@ class UnboundedSource(iobase.SourceBase):
   def get_checkpoint_mark_coder(self) -> Coder:
     """Returns the coder for this source's :class:`CheckpointMark` instances.
 
-    Called once at pipeline construction (graph build), NOT per-bundle. Do not
-    perform I/O here. Subclasses MUST override; the default raises with a
-    helpful message naming the subclass.
+    The SDK may call this while encoding or decoding source restrictions.
+    Implementations should be deterministic, side-effect free, and should not
+    perform I/O.
     """
     raise NotImplementedError(
         '%s must override get_checkpoint_mark_coder() to return a Coder for '
@@ -383,7 +381,7 @@ class _UnboundedSourceRestrictionTracker(iobase.RestrictionTracker):
   def current_restriction(self) -> _UnboundedSourceRestriction:
     return self._restriction
 
-  def try_claim(self, out: List[Any]) -> bool:
+  def try_claim(self, out: list[Any]) -> bool:
     """Advances the reader by one record.
 
     ``out[0]`` receives ``(value, record_timestamp, source_watermark)`` on the
@@ -401,7 +399,7 @@ class _UnboundedSourceRestrictionTracker(iobase.RestrictionTracker):
       self._close_reader_if_open()
       raise
 
-  def _try_claim_inner(self, out: List[Any]) -> bool:
+  def _try_claim_inner(self, out: list[Any]) -> bool:
     if self._restriction.is_done:
       out[0] = _NO_DATA
       return False
@@ -443,7 +441,7 @@ class _UnboundedSourceRestrictionTracker(iobase.RestrictionTracker):
 
   def try_split(
       self, fraction_of_remainder
-  ) -> Optional[Tuple[_UnboundedSourceRestriction,
+  ) -> Optional[tuple[_UnboundedSourceRestriction,
                       _UnboundedSourceRestriction]]:
     """Cuts a checkpoint, returning (primary, residual) or None.
 
@@ -637,28 +635,27 @@ class _ReadFromUnboundedSourceDoFn(core.DoFn):
         yield TimestampedValue(value, record_timestamp)
     finally:
       current = tracker.current_restriction()
-      # Register finalization only when a checkpoint was cut this bundle (the
-      # restriction identity changed), reading the explicit finalize channel.
-      finalize_mark = current.finalization_checkpoint_mark
-      if current is not initial and finalize_mark is not None:
-        bundle_finalizer.register(finalize_mark.finalize_checkpoint)
-      # Best-effort reader release for the downstream-yield-raised path (the
-      # tracker already closes on EOF, split, and reader-method failures),
-      # reached through the wrapper chain since the view hides the tracker.
-      inner_tracker = tracker
-      if hasattr(inner_tracker, '_threadsafe_restriction_tracker'):
-        inner_tracker = inner_tracker._threadsafe_restriction_tracker
-      if hasattr(inner_tracker, '_restriction_tracker'):
-        inner_tracker = inner_tracker._restriction_tracker
-      if isinstance(inner_tracker, _UnboundedSourceRestrictionTracker):
-        inner_tracker._close_reader_if_open()
-      else:
-        _LOGGER.warning(
-            'UnboundedSource DoFn could not close a reader because the SDF '
-            'tracker wrapper did not expose _UnboundedSourceRestrictionTracker '
-            '(got %s). Reader resources may remain open until garbage '
-            'collection.',
-            type(inner_tracker).__name__)
+      try:
+        # Register finalization only when a checkpoint was cut this bundle.
+        finalize_mark = current.finalization_checkpoint_mark
+        if current is not initial and finalize_mark is not None:
+          bundle_finalizer.register(finalize_mark.finalize_checkpoint)
+      finally:
+        # Best-effort reader release for the downstream-yield-raised path.
+        inner_tracker = tracker
+        if hasattr(inner_tracker, '_threadsafe_restriction_tracker'):
+          inner_tracker = inner_tracker._threadsafe_restriction_tracker
+        if hasattr(inner_tracker, '_restriction_tracker'):
+          inner_tracker = inner_tracker._restriction_tracker
+        if isinstance(inner_tracker, _UnboundedSourceRestrictionTracker):
+          inner_tracker._close_reader_if_open()
+        else:
+          _LOGGER.warning(
+              'UnboundedSource DoFn could not close a reader because the SDF '
+              'tracker wrapper did not expose '
+              '_UnboundedSourceRestrictionTracker (got %s). Reader resources '
+              'may remain open until garbage collection.',
+              type(inner_tracker).__name__)
 
 
 def _set_watermark_if_greater(
@@ -687,6 +684,9 @@ class ReadFromUnboundedSource(PTransform):
   def expand(self, pbegin):
     source = self._source
     output_coder = source.default_output_coder()
+    # The source is the SDF element used to derive the initial restriction.
+    # process() reads from the restriction, so it does not use the element
+    # directly.
     output = (
         pbegin
         | 'Create' >> core.Create([source])
