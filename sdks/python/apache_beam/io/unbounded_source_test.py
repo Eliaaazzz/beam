@@ -29,6 +29,8 @@ import pickle
 import tempfile
 import unittest
 
+from typing_extensions import override
+
 import apache_beam as beam
 from apache_beam import coders
 from apache_beam.io import unbounded_source as _unbounded_source_module
@@ -52,7 +54,6 @@ from apache_beam.transforms.window import FixedWindows
 from apache_beam.utils.timestamp import MAX_TIMESTAMP
 from apache_beam.utils.timestamp import MIN_TIMESTAMP
 from apache_beam.utils.timestamp import Timestamp
-from typing_extensions import override
 
 # pylint: disable=expression-not-assigned
 
@@ -994,6 +995,7 @@ class CircularImportOrderTest(unittest.TestCase):
         fp.write(script)
       return subprocess.run([sys.executable, path],
                             capture_output=True,
+                            check=False,
                             text=True,
                             env=env,
                             timeout=60)
