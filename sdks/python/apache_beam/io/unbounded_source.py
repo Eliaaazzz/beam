@@ -44,6 +44,16 @@ windows can close), checkpoint-based pause/resume (``defer_remainder``),
 deterministic reader close on EOF / split / exception, and bundle finalization.
 
 Out of scope for this PoC (tracked under #19137):
+  * Per-bundle read bound. ``process()`` reads every record the reader makes
+    available and only yields control on a no-data poll (self-checkpoint) or
+    EOF. A genuinely saturated source that always has data will therefore
+    keep one bundle running indefinitely -- the watermark advances on the
+    in-bundle estimator but is not committed downstream, and no checkpoint /
+    finalize is cut, until the source idles. Java bounds each SDF call via
+    ``OutputAndTimeBoundedSplittableProcessElementInvoker`` (a max element
+    count / wall-clock per invocation); the equivalent forced-defer is W2
+    work. Self-terminating finite sources (and any source that periodically
+    returns no-data) are unaffected.
   * Record-id-based deduplication (Java's ``ValueWithRecordId``).
   * Backlog-byte reporting (``restriction_size`` is a constant 1; per-restriction
     progress is binary 0.0 / 1.0).

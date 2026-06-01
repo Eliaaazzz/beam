@@ -889,11 +889,12 @@ class ReadFromUnboundedSourceValidationTest(unittest.TestCase):
 
 
 class CloudpicklePicklabilityTest(unittest.TestCase):
-  """The DoFn class is defined inside ``ReadFromUnboundedSource.expand`` so it
-  can close over the source-specific provider. Beam's default pickler is
-  cloudpickle; stdlib pickle would fail on a closure-defined class. This is a
-  regression guard for cross-runner portability (Dataflow / Flink portable
-  workers also use cloudpickle).
+  """``_ReadFromUnboundedSourceDoFn`` and ``_PROVIDER`` are module-level (not
+  nested in ``ReadFromUnboundedSource.expand``) specifically so stdlib pickle --
+  not just cloudpickle -- can serialise them. Beam's default pickler is
+  cloudpickle, but some runners fall back to stdlib pickle, which fails on
+  closure-defined classes. This is a regression guard for cross-runner
+  portability (Dataflow / Flink portable workers also use cloudpickle).
   """
   def test_transform_round_trips_through_cloudpickle(self):
     from apache_beam.internal import pickler
@@ -1043,7 +1044,8 @@ class DoFnReaderCloseOnDownstreamRaiseTest(unittest.TestCase):
           _wait_for_marker(marker),
           'DoFn finally did not invoke reader.close() when the generator '
           'was closed (GeneratorExit) -- reader leaked. Private-chain '
-          'close in unbounded_source.py:expand finally may be broken.')
+          'close in _ReadFromUnboundedSourceDoFn.process finally may be '
+          'broken.')
     finally:
       if os.path.exists(marker):
         os.unlink(marker)
