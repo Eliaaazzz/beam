@@ -57,13 +57,13 @@ from apache_beam.utils.timestamp import Timestamp
 
 # pylint: disable=expression-not-assigned
 
-# Realistic (non-epoch) event-time base for the demo source.
+# Realistic event-time base away from the Unix epoch.
 _EVENT_TIME_BASE = Timestamp(1729987200)  # 2024-10-27T00:00:00Z
 
 # ------------------------------------------------------------------------------
-# In-memory demo source emitting integers 0..count-1 (event time
-# ``_EVENT_TIME_BASE + index``); self-terminates at EOF, resumes from
-# ``last_index + 1``, and splits into even/odd sub-sources when is_splittable.
+# In-memory demo source emitting integers 0..count-1 with event time
+# ``_EVENT_TIME_BASE + index``. It self-terminates at EOF, resumes from
+# ``last_index + 1``, and splits into even/odd sub-sources when configured.
 # ------------------------------------------------------------------------------
 
 
@@ -254,7 +254,7 @@ class _PrefixStringSource(_StringCountingSource):
 
 
 class _NoDataReader(UnboundedReader):
-  """Always reports 'no data right now' (watermark < MAX, so never EOF)."""
+  """Always reports temporary absence of data with watermark below MAX."""
   @override
   def start(self):
     return False
@@ -273,7 +273,7 @@ class _NoDataReader(UnboundedReader):
 
   @override
   def get_watermark(self):
-    return Timestamp(0)
+    return _EVENT_TIME_BASE
 
   @override
   def get_checkpoint_mark(self):
@@ -478,7 +478,7 @@ class RestrictionTrackerTest(unittest.TestCase):
 
       @override
       def get_current_timestamp(self):
-        return Timestamp(0)
+        return _EVENT_TIME_BASE
 
       @override
       def get_watermark(self):
@@ -550,7 +550,7 @@ class RestrictionTrackerTest(unittest.TestCase):
   def test_no_data_returns_sentinel_without_finishing(self):
     tracker = _new_tracker(_NoDataSource())
     claimed, record = _claim(tracker)
-    self.assertTrue(claimed)  # not EOF
+    self.assertTrue(claimed)
     self.assertIs(record, _NO_DATA)
     # A self-checkpoint is still possible (poll/resume path).
     self.assertIsNotNone(tracker.try_split(0))
@@ -703,11 +703,11 @@ class ReaderCloseTest(unittest.TestCase):
 
       @override
       def get_current_timestamp(self):
-        return Timestamp(0)
+        return _EVENT_TIME_BASE
 
       @override
       def get_watermark(self):
-        return Timestamp(0)
+        return _EVENT_TIME_BASE
 
       @override
       def get_checkpoint_mark(self):
@@ -732,9 +732,10 @@ class ReaderCloseTest(unittest.TestCase):
 
     tracker = _new_tracker(_BoomSource())
     _claim(tracker)
-    # Helper must not propagate the reader's close() exception, otherwise the
-    # DoFn's finally / split paths would mask the original error.
-    tracker._close_reader_if_open()
+    with self.assertLogs(_unbounded_source_module._LOGGER, 'WARNING') as logs:
+      tracker._close_reader_if_open()
+    self.assertTrue(
+        any('Error closing UnboundedReader' in line for line in logs.output))
     self.assertIsNone(tracker._reader)
 
 
@@ -845,11 +846,11 @@ class TrackerContractRegressionTest(unittest.TestCase):
 
       @override
       def get_current_timestamp(self):
-        return Timestamp(0)
+        return _EVENT_TIME_BASE
 
       @override
       def get_watermark(self):
-        return Timestamp(0)
+        return _EVENT_TIME_BASE
 
       @override
       def get_checkpoint_mark(self):
@@ -963,9 +964,8 @@ class ReadFromUnboundedSourceValidationTest(unittest.TestCase):
 
 
 class StdlibPicklabilityTest(unittest.TestCase):
-  """``_ReadFromUnboundedSourceDoFn`` and ``_PROVIDER`` are module-level (not
-  nested in ``ReadFromUnboundedSource.expand``) specifically so stdlib pickle --
-  not just cloudpickle -- can serialise them.
+  """``_ReadFromUnboundedSourceDoFn`` and ``_PROVIDER`` are module-level so both
+  stdlib pickle and cloudpickle can serialise them.
   """
   def test_module_level_dofn_round_trips_through_stdlib_pickle(self):
     restored = pickle.loads(
@@ -1037,15 +1037,19 @@ import sys
 import apache_beam as beam
 from apache_beam import coders
 import apache_beam.io.iobase as iobase
+from typing_extensions import override
 # Now import unbounded_source AFTER iobase, then verify Read.expand
 # successfully lazy-imports ReadFromUnboundedSource:
 from apache_beam.io.unbounded_source import UnboundedSource
 
 class _S(UnboundedSource):
+  @override
   def split(self, n, options=None):
     return [self]
+  @override
   def create_reader(self, o, cp):
     return None
+  @override
   def get_checkpoint_mark_coder(self):
     return coders.PickleCoder()
 

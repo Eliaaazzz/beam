@@ -48,7 +48,7 @@ To define a source, implement :class:`UnboundedSource`, an
         ...
 
       def advance(self):
-        # Move to the next record; ``False`` means no data right now (not EOF).
+        # Move to the next record; ``False`` means no data is available now.
         ...
 
       def get_current(self):
@@ -164,7 +164,7 @@ class UnboundedReader(object):
     raise NotImplementedError
 
   def advance(self) -> bool:
-    """Advances to the next record. ``False`` == no data *now*, not EOF."""
+    """Advances to the next record. ``False`` means no data is available now."""
     raise NotImplementedError
 
   def get_current(self) -> Any:
@@ -176,7 +176,7 @@ class UnboundedReader(object):
     raise NotImplementedError
 
   def get_watermark(self) -> Timestamp:
-    """A best-effort lower bound on timestamps of future records.
+    """An approximate lower bound on timestamps of future records.
 
     Treated as monotonic by the wrapper. Return ``MAX_TIMESTAMP`` to signal that
     this reader has permanently finished.
@@ -222,8 +222,8 @@ class UnboundedSource(iobase.SourceBase):
         produces the very first record of the source (or returns ``False`` if
         none yet).
       * When ``checkpoint_mark`` is not ``None``, the returned reader's
-        ``start()`` produces the FIRST record strictly AFTER the position
-        encoded by ``checkpoint_mark``. The reader must NOT re-deliver records
+        ``start()`` produces the first record strictly after the position
+        encoded by ``checkpoint_mark``. The reader must not re-deliver records
         already covered by the prior bundle.
     """
     raise NotImplementedError
@@ -265,7 +265,7 @@ class _UnboundedSourceRestriction(object):
 
   Field roles:
     * ``checkpoint_mark`` -- RESUME state. A reader rebuilt from this mark
-      MUST produce the FIRST record strictly AFTER it (i.e. no re-delivery).
+      must produce the first record strictly after it.
     * ``finalization_checkpoint_mark`` -- COMMIT hook. Only set on a done
       primary that was just cut this bundle. Registered with the runner's
       bundle finalizer to acknowledge upstream. Independent of
@@ -284,12 +284,11 @@ class _UnboundedSourceRestrictionCoder(Coder):
 
   Stateless: at encode time the source's own
   :meth:`UnboundedSource.get_checkpoint_mark_coder` is looked up from the
-  restriction; at decode time the source is decoded FIRST and its coder
+  restriction; at decode time the source is decoded first and its coder
   drives the checkpoint-mark decoding. This avoids passing source-specific
   coder state into the coder's constructor, which in turn lets
   :class:`_UnboundedSourceRestrictionProvider` and
-  :class:`_ReadFromUnboundedSourceDoFn` be module-level classes (avoiding
-  stdlib-pickle gotchas for closure-defined DoFns on some runners).
+  :class:`_ReadFromUnboundedSourceDoFn` be module-level classes.
 
   Wire shape: source_bytes / checkpoint_bytes / watermark / done /
   finalization_checkpoint_bytes -- the checkpoint and finalization bytes
@@ -432,8 +431,7 @@ class _UnboundedSourceRestrictionTracker(iobase.RestrictionTracker):
       self._checkpoint_taken = True
       out[0] = _NO_DATA
       return False
-    # No data right now (not EOF): refresh the watermark so process() can
-    # advance it before deferring, then let process() self-checkpoint.
+    # No data is available now. Refresh the watermark before deferring.
     self._restriction = dataclasses.replace(
         self._restriction, watermark=watermark)
     out[0] = _NO_DATA
@@ -514,9 +512,8 @@ class _UnboundedSourceRestrictionProvider(core.RestrictionProvider):
   Stateless module-level singleton (see :data:`_PROVIDER`): all
   source-specific state (e.g. the source's checkpoint coder) is derived
   per-call from the restriction's ``source`` field, which lets
-  :class:`_ReadFromUnboundedSourceDoFn` live at module level too -- avoiding
-  stdlib-pickle gotchas for closure-defined DoFns. The provider currently
-  passes ``None`` for the ``options`` forwarded to
+  :class:`_ReadFromUnboundedSourceDoFn` live at module level too. The provider
+  currently passes ``None`` for the ``options`` forwarded to
   :meth:`UnboundedSource.split`.
   """
   def __init__(self):
@@ -594,9 +591,8 @@ _PROVIDER = _UnboundedSourceRestrictionProvider()
 class _ReadFromUnboundedSourceDoFn(core.DoFn):
   """SDF wrapper driving an :class:`UnboundedReader` for one restriction.
 
-  Module-level (not nested inside ``ReadFromUnboundedSource.expand``) so stdlib
-  ``pickle`` -- not just cloudpickle -- can serialise the DoFn. The restriction
-  provider is the module-level :data:`_PROVIDER` singleton.
+  Module-level so stdlib pickle and cloudpickle can serialise the DoFn. The
+  restriction provider is the module-level :data:`_PROVIDER` singleton.
   """
   @core.DoFn.unbounded_per_element()
   def process(
@@ -621,15 +617,15 @@ class _ReadFromUnboundedSourceDoFn(core.DoFn):
           break
         record = holder[0]
         if record is _NO_DATA:
-          # No data right now: advance the watermark and self-checkpoint so
-          # the runner reschedules us after a short delay.
+          # No data is available now: advance the watermark and self-checkpoint
+          # so the runner reschedules us after a short delay.
           _set_watermark_if_greater(
               watermark_estimator, tracker.current_restriction().watermark)
           tracker.defer_remainder(
               Duration(seconds=_DEFAULT_POLL_INTERVAL_SECONDS))
           break
-        # Advance the estimator with the source watermark (third slot), not
-        # the record's event time.
+        # The third tuple field is the source watermark. The record timestamp
+        # remains the output event time.
         value, record_timestamp, source_watermark = record
         _set_watermark_if_greater(watermark_estimator, source_watermark)
         yield TimestampedValue(value, record_timestamp)
@@ -641,7 +637,7 @@ class _ReadFromUnboundedSourceDoFn(core.DoFn):
         if current is not initial and finalize_mark is not None:
           bundle_finalizer.register(finalize_mark.finalize_checkpoint)
       finally:
-        # Best-effort reader release for the downstream-yield-raised path.
+        # Release the reader on downstream-yield errors.
         inner_tracker = tracker
         if hasattr(inner_tracker, '_threadsafe_restriction_tracker'):
           inner_tracker = inner_tracker._threadsafe_restriction_tracker
@@ -668,7 +664,7 @@ def _set_watermark_if_greater(
 
 
 class ReadFromUnboundedSource(PTransform):
-  """Reads an :class:`UnboundedSource` via a Splittable ``DoFn``.
+  """Reads an :class:`UnboundedSource`.
 
   Most users should prefer :class:`apache_beam.io.Read`, which dispatches an
   ``UnboundedSource`` here automatically::
@@ -692,8 +688,8 @@ class ReadFromUnboundedSource(PTransform):
         | 'Create' >> core.Create([source])
         | 'ReadUnbounded' >> core.ParDo(_ReadFromUnboundedSourceDoFn()))
     # Surface an element type only when the global registry already maps it to
-    # an equivalent coder; we don't mutate ``coders.registry`` (can't register a
-    # parameterized coder by class without leaking/losing state).
+    # an equivalent coder. Avoid mutating ``coders.registry`` for a
+    # parameterized coder whose instance state would be lost.
     try:
       type_hint = output_coder.to_type_hint()
     except NotImplementedError:
