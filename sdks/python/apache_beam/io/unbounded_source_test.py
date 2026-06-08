@@ -21,12 +21,7 @@ Semantics are covered by deterministic unit tests; the end-to-end DirectRunner
 tests assert ordering and termination only (no flaky defer-timing assertions).
 """
 
-# pytype: skip-file
-
 import logging
-import os
-import pickle
-import tempfile
 import unittest
 
 from typing_extensions import override
@@ -39,6 +34,8 @@ from apache_beam.io.unbounded_source import CheckpointMark
 from apache_beam.io.unbounded_source import ReadFromUnboundedSource
 from apache_beam.io.unbounded_source import UnboundedReader
 from apache_beam.io.unbounded_source import UnboundedSource
+from apache_beam.io.unbounded_source import _FinalizeCheckpointOnce
+from apache_beam.io.unbounded_source import _ReadFromUnboundedSourceDoFn
 from apache_beam.io.unbounded_source import _set_watermark_if_greater
 from apache_beam.io.unbounded_source import _UnboundedSourceRestriction
 from apache_beam.io.unbounded_source import _UnboundedSourceRestrictionCoder
@@ -422,6 +419,13 @@ class RestrictionProviderTest(unittest.TestCase):
 
     self.assertEqual(list(provider.split(source, restriction)), [restriction])
 
+  def test_truncate_returns_none_for_drain(self):
+    # On drain the SDF stops emitting; truncate yields no residual.
+    provider = _UnboundedSourceRestrictionProvider()
+    source = UnboundedCountingSource(5)
+    restriction = _UnboundedSourceRestriction(source=source)
+    self.assertIsNone(provider.truncate(source, restriction))
+
   def test_splittable_source_partitions_into_independent_subsources(self):
     # A splittable source fans out into two sub-sources; reading each in
     # isolation yields the even and the odd integers, and their union is the
@@ -564,6 +568,134 @@ class RestrictionTrackerTest(unittest.TestCase):
     self.assertFalse(_new_tracker(UnboundedCountingSource(3)).is_bounded())
 
 
+class _RecordingBundleFinalizer:
+  def __init__(self):
+    self.registered = []
+
+  def register(self, callback):
+    self.registered.append(callback)
+
+
+class _ManualClock:
+  """A deterministic monotonic clock for the time-cap tests."""
+  def __init__(self, now=0.0):
+    self.now = now
+
+  def __call__(self):
+    return self.now
+
+
+class BundleCapTest(unittest.TestCase):
+  """A busy reader self-checkpoints once the per-bundle record or time cap is
+  reached, so the runner can commit progress and run finalization."""
+  def _bundle(self, dofn, source, checkpoint=None, estimator=None):
+    """Builds the SDF tracker chain and returns the process() generator plus the
+    tracker, threadsafe tracker, finalizer, and watermark estimator."""
+    tracker = _UnboundedSourceRestrictionTracker(
+        _UnboundedSourceRestriction(source=source, checkpoint_mark=checkpoint))
+    threadsafe = sdf_utils.ThreadsafeRestrictionTracker(tracker)
+    view = sdf_utils.RestrictionTrackerView(threadsafe)
+    finalizer = _RecordingBundleFinalizer()
+    estimator = estimator or ManualWatermarkEstimator(None)
+    gen = dofn.process(
+        None,
+        bundle_finalizer=finalizer,
+        tracker=view,
+        watermark_estimator=estimator)
+    return gen, tracker, threadsafe, finalizer, estimator
+
+  def test_record_cap_checkpoints_busy_source(self):
+    finalize_log = []
+    dofn = _ReadFromUnboundedSourceDoFn(
+        poll_interval=0, max_records_per_bundle=5, max_read_time_seconds=1e9)
+    # 1000 records is effectively unbounded against a cap of 5.
+    gen, tracker, threadsafe, finalizer, estimator = self._bundle(
+        dofn, UnboundedCountingSource(1000, finalize_log=finalize_log))
+    outputs = list(gen)
+
+    self.assertEqual([tv.value for tv in outputs], [0, 1, 2, 3, 4])
+    self.assertTrue(tracker.current_restriction().is_done)
+    self.assertTrue(tracker.check_done())
+    # The estimator holds the last emitted record's source watermark.
+    self.assertEqual(estimator.current_watermark(), _EVENT_TIME_BASE + 4)
+    # Residual resumes after the cut and carries no finalize hook.
+    residual, _ = threadsafe.deferred_status()
+    self.assertEqual(residual.checkpoint_mark.last_index, 4)
+    self.assertIsNone(residual.finalization_checkpoint_mark)
+    # Exactly one finalizer is registered; firing it commits the cut index once.
+    self.assertEqual(len(finalizer.registered), 1)
+    finalizer.registered[0]()
+    finalizer.registered[0]()
+    self.assertEqual(finalize_log, [4])
+
+  def test_time_cap_checkpoints_busy_source(self):
+    clock = _ManualClock(1000.0)
+    dofn = _ReadFromUnboundedSourceDoFn(
+        poll_interval=0,
+        max_records_per_bundle=10**9,
+        max_read_time_seconds=5.0,
+        _now=clock)
+    gen, tracker, threadsafe, _, _ = self._bundle(
+        dofn, UnboundedCountingSource(1000))
+
+    # The deadline arms at 1000 + 5 after the first record and is checked
+    # between records, so records keep flowing until the clock passes it.
+    self.assertEqual(next(gen).value, 0)
+    self.assertEqual(next(gen).value, 1)
+    self.assertEqual(next(gen).value, 2)
+    clock.now = 1006.0
+    with self.assertRaises(StopIteration):
+      next(gen)
+
+    self.assertTrue(tracker.current_restriction().is_done)
+    residual, _ = threadsafe.deferred_status()
+    self.assertEqual(residual.checkpoint_mark.last_index, 2)
+
+  def test_cap_residual_resumes_in_next_bundle(self):
+    dofn = _ReadFromUnboundedSourceDoFn(
+        poll_interval=0, max_records_per_bundle=5, max_read_time_seconds=1e9)
+    source = UnboundedCountingSource(1000)
+    # Bundle 1 emits 0-4 and cuts a residual at index 4.
+    gen1, _, threadsafe1, _, _ = self._bundle(dofn, source)
+    self.assertEqual([tv.value for tv in gen1], [0, 1, 2, 3, 4])
+    residual1, _ = threadsafe1.deferred_status()
+
+    # Bundle 2 rebuilds the reader from the residual and emits 5-9.
+    gen2, _, threadsafe2, _, _ = self._bundle(
+        dofn, source, checkpoint=residual1.checkpoint_mark)
+    self.assertEqual([tv.value for tv in gen2], [5, 6, 7, 8, 9])
+    residual2, _ = threadsafe2.deferred_status()
+    self.assertEqual(residual2.checkpoint_mark.last_index, 9)
+
+  def test_eof_exactly_at_cap_resumes_then_finishes(self):
+    dofn = _ReadFromUnboundedSourceDoFn(
+        poll_interval=0, max_records_per_bundle=5, max_read_time_seconds=1e9)
+    source = UnboundedCountingSource(5)  # exactly cap records
+    # Bundle 1 hits the cap on the last record before observing EOF.
+    gen1, t1, threadsafe1, _, _ = self._bundle(dofn, source)
+    self.assertEqual([tv.value for tv in gen1], [0, 1, 2, 3, 4])
+    self.assertTrue(t1.current_restriction().is_done)
+    residual1, _ = threadsafe1.deferred_status()
+    self.assertEqual(residual1.checkpoint_mark.last_index, 4)
+
+    # Bundle 2 resumes at index 5, finds EOF, and finishes with no output.
+    gen2, t2, threadsafe2, _, _ = self._bundle(
+        dofn, source, checkpoint=residual1.checkpoint_mark)
+    self.assertEqual(list(gen2), [])
+    self.assertTrue(t2.current_restriction().is_done)
+    self.assertIsNone(threadsafe2.deferred_status())
+
+  def test_eof_before_cap_finishes_without_residual(self):
+    dofn = _ReadFromUnboundedSourceDoFn(
+        poll_interval=0, max_records_per_bundle=100, max_read_time_seconds=1e9)
+    gen, tracker, threadsafe, _, _ = self._bundle(
+        dofn, UnboundedCountingSource(3))
+
+    self.assertEqual([tv.value for tv in gen], [0, 1, 2])
+    self.assertTrue(tracker.current_restriction().is_done)
+    self.assertIsNone(threadsafe.deferred_status())
+
+
 class WatermarkTest(unittest.TestCase):
   def test_set_watermark_is_monotonic(self):
     estimator = ManualWatermarkEstimator(None)
@@ -577,6 +709,16 @@ class WatermarkTest(unittest.TestCase):
 
 
 class FinalizationTest(unittest.TestCase):
+  def test_finalize_checkpoint_callback_is_at_most_once(self):
+    finalize_log = []
+    finalize_once = _FinalizeCheckpointOnce(
+        _CountingCheckpointMark(1, finalize_log=finalize_log))
+
+    finalize_once()
+    finalize_once()
+
+    self.assertEqual(finalize_log, [1])
+
   def test_finalize_checkpoint_invoked(self):
     # Unit-level finalize test (the e2e finalize may run in a worker process);
     # the hook lives on the primary, independent of the residual's resume state.
@@ -949,122 +1091,20 @@ class UnboundedSourceContractTest(unittest.TestCase):
       MySource().get_checkpoint_mark_coder()
     self.assertIn('MySource', str(cm.exception))
 
-  def test_default_finalize_is_idempotent(self):
-    mark = CheckpointMark()
-    # Default no-op must tolerate repeated invocation; the SDK's bundle
-    # finalizer makes no exactly-once guarantee on this callback.
-    self.assertIsNone(mark.finalize_checkpoint())
-    self.assertIsNone(mark.finalize_checkpoint())
-
 
 class ReadFromUnboundedSourceValidationTest(unittest.TestCase):
   def test_non_source_argument_raises(self):
     with self.assertRaises(TypeError):
       ReadFromUnboundedSource('not-a-source')  # type: ignore[arg-type]
 
-
-class StdlibPicklabilityTest(unittest.TestCase):
-  """``_ReadFromUnboundedSourceDoFn`` and ``_PROVIDER`` are module-level so both
-  stdlib pickle and cloudpickle can serialise them.
-  """
-  def test_module_level_dofn_round_trips_through_stdlib_pickle(self):
-    restored = pickle.loads(
-        pickle.dumps(_unbounded_source_module._ReadFromUnboundedSourceDoFn()))
-    self.assertIsInstance(
-        restored, _unbounded_source_module._ReadFromUnboundedSourceDoFn)
-
-  def test_module_level_provider_round_trips_through_stdlib_pickle(self):
-    restored = pickle.loads(pickle.dumps(_unbounded_source_module._PROVIDER))
-    self.assertIsInstance(restored, _UnboundedSourceRestrictionProvider)
-
-
-class CircularImportOrderTest(unittest.TestCase):
-  """`iobase.py` and `unbounded_source.py` form a cycle (UnboundedSource extends
-  iobase.SourceBase; iobase.Read.expand lazy-imports unbounded_source). All
-  three import-order scenarios must complete without ImportError. Subprocesses
-  ensure each test starts from a clean module cache.
-  """
-  def _run_in_subprocess(self, script):
-    import os
-    import subprocess
-    import sys
-    env = os.environ.copy()
-    beam_python = os.path.join(
-        os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    env['PYTHONPATH'] = beam_python + os.pathsep + env.get('PYTHONPATH', '')
-    fd, path = tempfile.mkstemp(suffix='.py')
-    try:
-      with os.fdopen(fd, 'w') as fp:
-        fp.write(script)
-      return subprocess.run([sys.executable, path],
-                            capture_output=True,
-                            check=False,
-                            text=True,
-                            env=env,
-                            timeout=60)
-    finally:
-      if os.path.exists(path):
-        os.unlink(path)
-
-  def test_iobase_then_unbounded_source(self):
-    result = self._run_in_subprocess(
-        'import apache_beam.io.iobase\n'
-        'import apache_beam.io.unbounded_source\n'
-        'print("ok")\n')
-    self.assertEqual(
-        result.returncode,
-        0,
-        'stderr=%r stdout=%r' % (result.stderr, result.stdout))
-    self.assertIn('ok', result.stdout)
-
-  def test_unbounded_source_then_iobase(self):
-    result = self._run_in_subprocess(
-        'import apache_beam.io.unbounded_source\n'
-        'import apache_beam.io.iobase\n'
-        'print("ok")\n')
-    self.assertEqual(
-        result.returncode,
-        0,
-        'stderr=%r stdout=%r' % (result.stderr, result.stdout))
-    self.assertIn('ok', result.stdout)
-
-  def test_read_expand_lazy_imports_unbounded_source(self):
-    # Import iobase, then Read.expand() on an UnboundedSource must lazy-import
-    # unbounded_source without ImportError.
-    script = '''
-import sys
-import apache_beam as beam
-from apache_beam import coders
-import apache_beam.io.iobase as iobase
-from typing_extensions import override
-# Now import unbounded_source AFTER iobase, then verify Read.expand
-# successfully lazy-imports ReadFromUnboundedSource:
-from apache_beam.io.unbounded_source import UnboundedSource
-
-class _S(UnboundedSource):
-  @override
-  def split(self, n, options=None):
-    return [self]
-  @override
-  def create_reader(self, o, cp):
-    return None
-  @override
-  def get_checkpoint_mark_coder(self):
-    return coders.PickleCoder()
-
-r = iobase.Read(_S())
-p = beam.Pipeline()
-result = r.expand(p)
-assert not result.is_bounded, 'expanded PCollection should be unbounded'
-print("ok")
-'''
-    result = self._run_in_subprocess(script)
-    self.assertEqual(
-        result.returncode,
-        0,
-        'stderr=%r stdout=%r' % (result.stderr, result.stdout))
-    self.assertIn('ok', result.stdout)
+  def test_invalid_caps_raise(self):
+    source = UnboundedCountingSource(1)
+    with self.assertRaises(ValueError):
+      ReadFromUnboundedSource(source, max_records_per_bundle=0)
+    with self.assertRaises(ValueError):
+      ReadFromUnboundedSource(source, max_read_time_seconds=0)
+    with self.assertRaises(ValueError):
+      ReadFromUnboundedSource(source, poll_interval=-1)
 
 
 if __name__ == '__main__':

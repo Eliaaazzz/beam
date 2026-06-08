@@ -39,7 +39,7 @@ To define a source, implement :class:`UnboundedSource`, an
 
       def finalize_checkpoint(self):
         # Commit/acknowledge records up to ``position`` upstream, e.g. ack the
-        # consumed messages on a queue. Must be idempotent.
+        # consumed messages on a queue.
         ...
 
     class MyReader(UnboundedReader):
@@ -83,11 +83,12 @@ Read the source in a pipeline with :class:`apache_beam.io.Read`::
       p | beam.io.Read(MySource()) | beam.Map(print)
 """
 
-# pytype: skip-file
-
 import dataclasses
 import logging
+import threading
+import time
 from typing import Any
+from typing import Callable
 from typing import Iterable
 from typing import Optional
 
@@ -124,6 +125,8 @@ _NO_DATA = object()
 
 _DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 _DEFAULT_DESIRED_NUM_SPLITS = 20
+_DEFAULT_MAX_RECORDS_PER_BUNDLE = 10000
+_DEFAULT_MAX_READ_TIME_SECONDS = 10.0
 
 # ------------------------------------------------------------------------------
 # Public abstract base classes.
@@ -143,9 +146,11 @@ class CheckpointMark(object):
     Override to acknowledge/commit upstream (for example, ack the consumed
     messages on a queue). The default is a no-op.
 
-    Implementations must be idempotent: the runner may retry the callback on
-    the same mark, and each bundle produces a fresh mark covering the records
-    read so far. An exception raised here is logged but not retried.
+    The runner calls this at most once for a committed checkpoint mark.
+    Finalization is best effort; a mark may never be finalized. An exception
+    raised here is logged. On bundle retry an uncommitted mark may be re-cut
+    over an overlapping span, so this method must be idempotent (acknowledge by
+    absolute position).
     """
     pass
 
@@ -466,6 +471,8 @@ class _UnboundedSourceRestrictionTracker(iobase.RestrictionTracker):
     if self._reader is None or not self._started or self._restriction.is_done:
       return None
     checkpoint = self._reader.get_checkpoint_mark()
+    # The residual watermark is advisory; the SDF watermark estimator state is
+    # the authoritative cross-bundle watermark.
     watermark = self._reader.get_watermark()
     # Keep the two channels independent: the primary carries only the finalize
     # hook, the residual only the resume state.
@@ -588,12 +595,46 @@ class _UnboundedSourceRestrictionProvider(core.RestrictionProvider):
 _PROVIDER = _UnboundedSourceRestrictionProvider()
 
 
+class _FinalizeCheckpointOnce(object):
+  def __init__(self, checkpoint_mark: CheckpointMark):
+    self._checkpoint_mark = checkpoint_mark
+    # The lock keeps finalization idempotent if a runner ever invokes the
+    # callback more than once.
+    self._lock = threading.Lock()
+    self._finalized = False
+
+  def __call__(self) -> None:
+    with self._lock:
+      if self._finalized:
+        return
+      self._finalized = True
+    # Finalization is best effort: log and swallow so a failing user override
+    # does not fail the bundle (matches CheckpointMark.finalize_checkpoint).
+    try:
+      self._checkpoint_mark.finalize_checkpoint()
+    except Exception:  # pylint: disable=broad-except
+      _LOGGER.warning(
+          'Error finalizing UnboundedSource checkpoint mark.', exc_info=True)
+
+
 class _ReadFromUnboundedSourceDoFn(core.DoFn):
   """SDF wrapper driving an :class:`UnboundedReader` for one restriction.
 
   Module-level so stdlib pickle and cloudpickle can serialise the DoFn. The
   restriction provider is the module-level :data:`_PROVIDER` singleton.
   """
+  def __init__(
+      self,
+      poll_interval: float = _DEFAULT_POLL_INTERVAL_SECONDS,
+      max_records_per_bundle: int = _DEFAULT_MAX_RECORDS_PER_BUNDLE,
+      max_read_time_seconds: float = _DEFAULT_MAX_READ_TIME_SECONDS,
+      _now: Optional[Callable[[], float]] = None):
+    self._poll_interval = poll_interval
+    self._max_records_per_bundle = max_records_per_bundle
+    self._max_read_time_seconds = max_read_time_seconds
+    # Monotonic clock seam; tests inject a deterministic clock.
+    self._now = _now
+
   @core.DoFn.unbounded_per_element()
   def process(
       self,
@@ -606,6 +647,10 @@ class _ReadFromUnboundedSourceDoFn(core.DoFn):
     # kwarg-injected ones (tracker, watermark estimator).
     assert isinstance(tracker, sdf_utils.RestrictionTrackerView)
     initial = tracker.current_restriction()
+    now = self._now or time.monotonic
+    records_emitted = 0
+    # Armed on the first emitted record so reader startup is excluded.
+    read_deadline = None  # type: Optional[float]
     try:
       while True:
         holder = [None]
@@ -617,25 +662,38 @@ class _ReadFromUnboundedSourceDoFn(core.DoFn):
           break
         record = holder[0]
         if record is _NO_DATA:
-          # No data is available now: advance the watermark and self-checkpoint
-          # so the runner reschedules us after a short delay.
+          # No data now: advance the watermark and self-checkpoint with the
+          # poll delay so an idle source backs off before resuming.
           _set_watermark_if_greater(
               watermark_estimator, tracker.current_restriction().watermark)
-          tracker.defer_remainder(
-              Duration(seconds=_DEFAULT_POLL_INTERVAL_SECONDS))
+          tracker.defer_remainder(Duration(seconds=self._poll_interval))
           break
         # The third tuple field is the source watermark. The record timestamp
         # remains the output event time.
         value, record_timestamp, source_watermark = record
         _set_watermark_if_greater(watermark_estimator, source_watermark)
         yield TimestampedValue(value, record_timestamp)
+        records_emitted += 1
+        if read_deadline is None:
+          read_deadline = now() + self._max_read_time_seconds
+        # A busy reader never hits the EOF or no-data branch. Bound the bundle
+        # by record count and elapsed time so the runner commits the checkpoint
+        # and runs finalization, then resume with no delay. The deadline is
+        # checked between records; a reader that blocks inside advance() can
+        # overrun it, so the record cap is the hard backstop.
+        reached_record_cap = records_emitted >= self._max_records_per_bundle
+        if reached_record_cap or now() >= read_deadline:
+          tracker.defer_remainder()
+          break
     finally:
       current = tracker.current_restriction()
       try:
         # Register finalization only when a checkpoint was cut this bundle.
+        # The SDK bundle finalizer applies no deadline, so finalization is
+        # unbounded best effort.
         finalize_mark = current.finalization_checkpoint_mark
         if current is not initial and finalize_mark is not None:
-          bundle_finalizer.register(finalize_mark.finalize_checkpoint)
+          bundle_finalizer.register(_FinalizeCheckpointOnce(finalize_mark))
       finally:
         # Release the reader on downstream-yield errors.
         inner_tracker = tracker
@@ -670,12 +728,44 @@ class ReadFromUnboundedSource(PTransform):
   ``UnboundedSource`` here automatically::
 
       p | beam.io.Read(MyUnboundedSource())
+
+  Args:
+    source: the :class:`UnboundedSource` to read.
+    poll_interval: resume delay in seconds applied when the reader has no data,
+      which bounds how often an idle source is polled. Must be >= 0.
+    max_records_per_bundle: a busy reader self-checkpoints after emitting this
+      many records in one bundle. Must be >= 1. Defaults to 10000.
+    max_read_time_seconds: a busy reader self-checkpoints after this many
+      seconds in one bundle. Must be > 0. Defaults to 10.0. The deadline is
+      checked between records, so a reader that blocks inside ``advance()`` may
+      overrun it; ``max_records_per_bundle`` is the hard backstop.
+
+  The bundle self-checkpoints as soon as either cap is reached.
   """
-  def __init__(self, source: UnboundedSource):
+  def __init__(
+      self,
+      source: UnboundedSource,
+      poll_interval: float = _DEFAULT_POLL_INTERVAL_SECONDS,
+      max_records_per_bundle: int = _DEFAULT_MAX_RECORDS_PER_BUNDLE,
+      max_read_time_seconds: float = _DEFAULT_MAX_READ_TIME_SECONDS):
     if not isinstance(source, UnboundedSource):
       raise TypeError('source must be an UnboundedSource, got %r' % (source, ))
+    if max_records_per_bundle < 1:
+      raise ValueError(
+          'max_records_per_bundle must be >= 1, got %r' %
+          (max_records_per_bundle, ))
+    if max_read_time_seconds <= 0:
+      raise ValueError(
+          'max_read_time_seconds must be > 0, got %r' %
+          (max_read_time_seconds, ))
+    if poll_interval < 0:
+      raise ValueError(
+          'poll_interval must be >= 0, got %r' % (poll_interval, ))
     super().__init__()
     self._source = source
+    self._poll_interval = poll_interval
+    self._max_records_per_bundle = max_records_per_bundle
+    self._max_read_time_seconds = max_read_time_seconds
 
   def expand(self, pbegin):
     source = self._source
@@ -686,7 +776,11 @@ class ReadFromUnboundedSource(PTransform):
     output = (
         pbegin
         | 'Create' >> core.Create([source])
-        | 'ReadUnbounded' >> core.ParDo(_ReadFromUnboundedSourceDoFn()))
+        | 'ReadUnbounded' >> core.ParDo(
+            _ReadFromUnboundedSourceDoFn(
+                self._poll_interval,
+                self._max_records_per_bundle,
+                self._max_read_time_seconds)))
     # Surface an element type only when the global registry already maps it to
     # an equivalent coder. Avoid mutating ``coders.registry`` for a
     # parameterized coder whose instance state would be lost.

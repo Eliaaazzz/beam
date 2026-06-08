@@ -29,6 +29,8 @@ from apache_beam.io.concat_source import ConcatSource
 from apache_beam.io.concat_source_test import RangeSource
 from apache_beam.io.iobase import SourceBundle
 from apache_beam.options.pipeline_options import DebugOptions
+from apache_beam.portability import common_urns
+from apache_beam.portability import python_urns
 from apache_beam.testing.util import assert_that
 from apache_beam.testing.util import equal_to
 
@@ -232,54 +234,31 @@ class UseSdfUnboundedSourcesTests(unittest.TestCase):
 
   def test_read_unbounded_pcollection_is_unbounded(self):
     from apache_beam.io.unbounded_source_test import UnboundedCountingSource
-    with beam.Pipeline() as p:
-      out = p | beam.io.Read(UnboundedCountingSource(3))
-      self.assertFalse(out.is_bounded)
+    p = beam.Pipeline()
+    out = p | beam.io.Read(UnboundedCountingSource(3))
+    self.assertFalse(out.is_bounded)
 
-  def test_to_runner_api_emits_unbounded_read_payload(self):
-    """``Read.to_runner_api_parameter`` must serialize an UnboundedSource as
-    ``READ.urn`` with ``IsBounded.UNBOUNDED`` so the wire format round-trips
-    consistently for pipeline persistence and cross-runner submission.
-    """
+  def test_read_unbounded_serializes_as_expanded_composite(self):
     from apache_beam.io.unbounded_source_test import UnboundedCountingSource
-    from apache_beam.portability import common_urns
-    from apache_beam.portability.api import beam_runner_api_pb2
-    from apache_beam.runners.pipeline_context import PipelineContext
+    p = beam.Pipeline()
+    p | 'ReadIt' >> beam.io.Read(UnboundedCountingSource(3))
 
-    read = beam.io.Read(UnboundedCountingSource(5))
-    urn, payload = read.to_runner_api_parameter(PipelineContext())
+    proto = p.to_runner_api(use_fake_coders=True)
+    transforms = proto.components.transforms.values()
+    deprecated_reads = [
+        transform.unique_name for transform in transforms
+        if transform.spec.urn == common_urns.deprecated_primitives.READ.urn
+    ]
+    read_transforms = [
+        transform for transform in proto.components.transforms.values()
+        if transform.unique_name == 'ReadIt'
+    ]
 
-    self.assertEqual(urn, common_urns.deprecated_primitives.READ.urn)
-    self.assertIsInstance(payload, beam_runner_api_pb2.ReadPayload)
+    self.assertEqual([], deprecated_reads)
+    self.assertEqual(1, len(read_transforms))
     self.assertEqual(
-        payload.is_bounded, beam_runner_api_pb2.IsBounded.UNBOUNDED)
-    # The source field must be populated -- a non-empty FunctionSpec proto.
-    self.assertTrue(payload.source.urn)
-
-  def test_read_unbounded_round_trips_through_runner_api(self):
-    """Encode then decode via the runner-API protobuf. The restored
-    transform must be a ``Read`` wrapping an equivalent UnboundedSource.
-    """
-    from apache_beam.io.unbounded_source import UnboundedSource
-    from apache_beam.io.unbounded_source_test import UnboundedCountingSource
-    from apache_beam.portability.api import beam_runner_api_pb2
-    from apache_beam.runners.pipeline_context import PipelineContext
-
-    original = beam.io.Read(UnboundedCountingSource(7))
-    context = PipelineContext()
-    urn, payload = original.to_runner_api_parameter(context)
-
-    transform_proto = beam_runner_api_pb2.PTransform()
-    transform_proto.spec.urn = urn
-    restored = iobase.Read.from_runner_api_parameter(
-        transform_proto, payload, context)
-
-    self.assertIsInstance(restored, iobase.Read)
-    self.assertIsInstance(restored.source, UnboundedSource)
-    self.assertIsInstance(restored.source, UnboundedCountingSource)
-    self.assertFalse(restored.source.is_bounded())
-    # Verify the source's internal state survived pickle round-trip.
-    self.assertEqual(restored.source._count, 7)
+        python_urns.GENERIC_COMPOSITE_TRANSFORM, read_transforms[0].spec.urn)
+    self.assertTrue(read_transforms[0].subtransforms)
 
 
 if __name__ == '__main__':

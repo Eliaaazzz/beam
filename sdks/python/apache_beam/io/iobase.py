@@ -993,16 +993,16 @@ class Read(ptransform.PTransform):
               timestamp_attribute=self.source.timestamp_attribute,
               with_attributes=self.source.with_attributes,
               id_attribute=self.source.id_label))
-    # Local import to avoid a circular dependency.
-    from apache_beam.io.unbounded_source import UnboundedSource
-    if isinstance(self.source, (BoundedSource, UnboundedSource)):
+    if isinstance(self.source, BoundedSource):
       return (
           common_urns.deprecated_primitives.READ.urn,
           beam_runner_api_pb2.ReadPayload(
               source=self.source.to_runner_api(context),
-              is_bounded=beam_runner_api_pb2.IsBounded.BOUNDED
-              if self.source.is_bounded() else
-              beam_runner_api_pb2.IsBounded.UNBOUNDED))
+              is_bounded=beam_runner_api_pb2.IsBounded.BOUNDED))
+    # Local import to avoid a circular dependency.
+    from apache_beam.io.unbounded_source import UnboundedSource
+    if isinstance(self.source, UnboundedSource):
+      return super().to_runner_api_parameter(context)
     elif isinstance(self.source, ptransform.PTransform):
       return self.source.to_runner_api_parameter(context)
     raise NotImplementedError(
