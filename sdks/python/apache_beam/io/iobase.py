@@ -998,7 +998,9 @@ class Read(ptransform.PTransform):
           common_urns.deprecated_primitives.READ.urn,
           beam_runner_api_pb2.ReadPayload(
               source=self.source.to_runner_api(context),
-              is_bounded=beam_runner_api_pb2.IsBounded.BOUNDED))
+              is_bounded=beam_runner_api_pb2.IsBounded.BOUNDED
+              if self.source.is_bounded() else
+              beam_runner_api_pb2.IsBounded.UNBOUNDED))
     # Local import to avoid a circular dependency.
     from apache_beam.io.unbounded_source import UnboundedSource
     if isinstance(self.source, UnboundedSource):
