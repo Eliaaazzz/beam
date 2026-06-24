@@ -18,6 +18,7 @@
 """Tests for the Watch transform."""
 
 import collections
+import hashlib
 import unittest
 
 import apache_beam as beam
@@ -58,6 +59,47 @@ def _initial_polling(termination=None, now=Timestamp(0)):
   termination = termination or never()
   return _PollingGrowthState(
       collections.OrderedDict(), None, termination.for_new_input(now, 'input'))
+
+
+def _horizon_tracker(restriction, poll_fn, horizon, now=0.0):
+  return _GrowthRestrictionTracker(
+      restriction,
+      poll_fn,
+      StrUtf8Coder(),
+      never(), lambda: now,
+      Duration(horizon))
+
+
+def _hash(value):
+  return hashlib.blake2b(StrUtf8Coder().encode(value), digest_size=16).digest()
+
+
+class PollResultTest(unittest.TestCase):
+  def test_normalize_stamps_one_processing_time_when_timestamp_none(self):
+    before = Timestamp.now()
+    result = PollResult.incomplete(['a', 'b'])
+    after = Timestamp.now()
+    # Raw outputs share a single processing-time stamp (no per-output jitter).
+    stamps = {o.timestamp for o in result.outputs}
+    self.assertEqual(1, len(stamps))
+    ts = stamps.pop()
+    self.assertTrue(before <= ts <= after)
+
+  def test_normalize_preserves_timestamped_and_applies_explicit_default(self):
+    result = PollResult.incomplete([_ts('a', 1), 'b'], timestamp=7)
+    by_value = {o.value: o.timestamp for o in result.outputs}
+    self.assertEqual(Timestamp(1), by_value['a'])  # TimestampedValue preserved
+    self.assertEqual(Timestamp(7), by_value['b'])  # raw stamped with default
+
+  def test_complete_releases_watermark_to_max(self):
+    self.assertEqual(
+        MAX_TIMESTAMP, PollResult.complete([_ts('a', 1)]).watermark)
+    self.assertTrue(PollResult.complete([]).is_complete)
+
+  def test_with_watermark_overrides(self):
+    self.assertEqual(
+        Timestamp(0),
+        PollResult.incomplete([_ts('a', 9)]).with_watermark(0).watermark)
 
 
 class GrowthStateCoderTest(unittest.TestCase):
@@ -217,6 +259,267 @@ class GrowthTrackerTest(unittest.TestCase):
     self.assertIsInstance(residual, _PollingGrowthState)
     self.assertEqual(2, len(residual.completed))
 
+  def test_out_of_order_new_output_infers_its_earlier_event_time(self):
+    # Round 1 surfaces a@10; round 2 surfaces a brand-new b@5 (earlier). The
+    # round-2 inferred watermark is b's own time; the process() estimator's
+    # monotonic guard is what leaves b late. This locks in the
+    # reference-consistent behavior the design documents and warns about.
+    polls = []
+
+    def poll(unused_element):
+      polls.append(len(polls))
+      if len(polls) == 1:
+        return PollResult.incomplete([_ts('a', 10)])
+      return PollResult.incomplete([_ts('b', 5)])
+
+    tracker = _new_tracker(_initial_polling(), poll)
+    holder = ['input', None]
+    tracker.try_claim(holder)
+    self.assertEqual(Timestamp(10), holder[1][2])
+    _, residual = tracker.try_split(0)
+
+    resumed = _new_tracker(residual, poll)
+    holder = ['input', None]
+    self.assertTrue(resumed.try_claim(holder))
+    self.assertEqual(['b'], [o.value for o in holder[1][1]])
+    self.assertEqual(Timestamp(5), holder[1][2])
+
+  def test_explicit_watermark_holds_below_output_time(self):
+    # An explicit watermark below the output's own event time is honored, so a
+    # later earlier-timestamped output stays on time (the out-of-order-safe
+    # path).
+    def poll(unused_element):
+      return PollResult.incomplete([_ts('a', 10)]).with_watermark(0)
+
+    tracker = _new_tracker(_initial_polling(), poll)
+    holder = ['input', None]
+    tracker.try_claim(holder)
+    self.assertEqual(Timestamp(0), holder[1][2])
+    _, residual = tracker.try_split(0)
+    self.assertEqual(Timestamp(0), residual.poll_watermark)
+
+  def test_idle_round_reuses_completed_map_object(self):
+    # A round that discovers nothing (and no dedup horizon) must reuse the
+    # parent dedup map rather than copying it O(N).
+    polls = []
+
+    def poll(unused_element):
+      polls.append(len(polls))
+      if len(polls) == 1:
+        return PollResult.incomplete([_ts('a', 1)])
+      return PollResult.incomplete([])
+
+    tracker = _new_tracker(_initial_polling(), poll)
+    holder = ['input', None]
+    tracker.try_claim(holder)
+    _, residual1 = tracker.try_split(0)
+
+    resumed = _new_tracker(residual1, poll)
+    holder = ['input', None]
+    resumed.try_claim(holder)
+    _, residual2 = resumed.try_split(0)
+    self.assertIs(residual1.completed, residual2.completed)
+
+  def test_dedup_horizon_evicts_outputs_behind_the_watermark(self):
+    polls = []
+
+    def poll(unused_element):
+      polls.append(len(polls))
+      if len(polls) == 1:
+        return PollResult.incomplete([_ts('a', 10), _ts('b', 20)])
+      return PollResult.incomplete([_ts('c', 30)])
+
+    tracker = _horizon_tracker(_initial_polling(), poll, horizon=5)
+    holder = ['input', None]
+    tracker.try_claim(holder)
+    _, residual1 = tracker.try_split(0)
+    self.assertEqual(2, len(residual1.completed))  # nothing stale yet
+
+    resumed = _horizon_tracker(residual1, poll, horizon=5)
+    holder = ['input', None]
+    resumed.try_claim(holder)
+    _, residual2 = resumed.try_split(0)
+    # Watermark advanced to 30; a@10 and b@20 are older than 30-5=25, evicted.
+    self.assertEqual([_hash('c')], list(residual2.completed))
+    self.assertEqual(Timestamp(30), residual2.completed[_hash('c')])
+
+  def test_dedup_horizon_unset_retains_all_hashes(self):
+    polls = []
+
+    def poll(unused_element):
+      polls.append(len(polls))
+      if len(polls) == 1:
+        return PollResult.incomplete([_ts('a', 10), _ts('b', 20)])
+      return PollResult.incomplete([_ts('c', 30)])
+
+    tracker = _new_tracker(_initial_polling(), poll)
+    holder = ['input', None]
+    tracker.try_claim(holder)
+    _, residual1 = tracker.try_split(0)
+    resumed = _new_tracker(residual1, poll)
+    holder = ['input', None]
+    resumed.try_claim(holder)
+    _, residual2 = resumed.try_split(0)
+    self.assertEqual(3, len(residual2.completed))
+
+  def test_dedup_horizon_still_dedups_recent_outputs(self):
+    polls = []
+
+    def poll(unused_element):
+      polls.append(len(polls))
+      if len(polls) == 1:
+        return PollResult.incomplete([_ts('a', 10)])
+      # 'a' re-appears but is well within the (large) horizon, so it stays in
+      # the dedup set and only the genuinely-new 'b' is emitted.
+      return PollResult.incomplete([_ts('a', 10), _ts('b', 12)])
+
+    tracker = _horizon_tracker(_initial_polling(), poll, horizon=100)
+    holder = ['input', None]
+    tracker.try_claim(holder)
+    _, residual1 = tracker.try_split(0)
+    resumed = _horizon_tracker(residual1, poll, horizon=100)
+    holder = ['input', None]
+    resumed.try_claim(holder)
+    self.assertEqual(['b'], [o.value for o in holder[1][1]])
+
+  def test_dedup_horizon_reemits_a_value_resurfaced_at_a_fresh_timestamp(self):
+    # Documents the residual with_dedup_horizon hazard: a value re-returned at a
+    # NEWER, at-or-after-watermark timestamp is on time, so suppression does not
+    # drop it; with its entry already evicted it is seen as new and re-emitted.
+    # (A re-list at the original below-horizon timestamp is suppressed instead;
+    # see test_dedup_horizon_suppresses_aged_relist_and_advances_watermark.)
+    polls = []
+
+    def poll(unused_element):
+      polls.append(len(polls))
+      if len(polls) == 1:
+        return PollResult.incomplete([_ts('x', 10)])
+      if len(polls) == 2:
+        return PollResult.incomplete([_ts('y', 30)])  # advances watermark to 30
+      return PollResult.incomplete([_ts('x', 40)])  # x re-surfaces, on time
+
+    tracker = _horizon_tracker(_initial_polling(), poll, horizon=5)
+    holder = ['input', None]
+    tracker.try_claim(holder)
+    _, residual = tracker.try_split(0)
+
+    resumed = _horizon_tracker(residual, poll, horizon=5)
+    holder = ['input', None]
+    resumed.try_claim(holder)  # round 2: y@30, watermark->30, evict x@10 (<25)
+    _, residual = resumed.try_split(0)
+    self.assertNotIn(_hash('x'), residual.completed)
+
+    resumed2 = _horizon_tracker(residual, poll, horizon=5)
+    holder = ['input', None]
+    resumed2.try_claim(holder)  # round 3: x@40 re-emitted as a duplicate
+    self.assertEqual(['x'], [o.value for o in holder[1][1]])
+
+  def test_dedup_horizon_evicts_regardless_of_insertion_order(self):
+    # An explicit held-back watermark lets a later round insert an
+    # earlier-timestamped output after a future-timestamped one, so insertion
+    # order is not event-time order. Eviction must still drop the aged-out
+    # entry (a full scan, not a prefix scan).
+    polls = []
+
+    def poll(unused_element):
+      polls.append(len(polls))
+      if len(polls) == 1:
+        return PollResult.incomplete([_ts('future', 1000000)]).with_watermark(0)
+      if len(polls) == 2:
+        return PollResult.incomplete([_ts('old', 900)]).with_watermark(900)
+      return PollResult.incomplete([_ts('marker', 1005)]).with_watermark(1005)
+
+    state = _initial_polling()
+    for _ in range(3):
+      tracker = _horizon_tracker(state, poll, horizon=100)
+      holder = ['input', None]
+      tracker.try_claim(holder)
+      _, state = tracker.try_split(0)
+    # cutoff = 1005 - 100 = 905; old@900 is evicted even though 'future'
+    # precedes it in insertion order, while future@1000000 is retained.
+    self.assertNotIn(_hash('old'), state.completed)
+    self.assertIn(_hash('future'), state.completed)
+    self.assertIn(_hash('marker'), state.completed)
+
+  def test_dedup_horizon_keeps_entry_exactly_at_cutoff(self):
+    # Eviction is strict (< cutoff): an entry whose event time equals
+    # watermark - horizon is retained, not evicted.
+    polls = []
+
+    def poll(unused_element):
+      polls.append(len(polls))
+      if len(polls) == 1:
+        return PollResult.incomplete([_ts('a', 25)])
+      return PollResult.incomplete([_ts('b', 30)])  # watermark->30, cutoff=25
+
+    tracker = _horizon_tracker(_initial_polling(), poll, horizon=5)
+    holder = ['input', None]
+    tracker.try_claim(holder)
+    _, residual = tracker.try_split(0)
+    resumed = _horizon_tracker(residual, poll, horizon=5)
+    holder = ['input', None]
+    resumed.try_claim(holder)
+    _, residual = resumed.try_split(0)
+    self.assertIn(_hash('a'), residual.completed)  # a@25 == cutoff, kept
+    self.assertIn(_hash('b'), residual.completed)
+
+  def test_dedup_horizon_suppresses_aged_relist_and_advances_watermark(self):
+    # A full-relisting poll re-surfaces every output at its original event time
+    # every round. Once an output ages past the horizon its hash is evicted;
+    # suppression then drops the re-listed copy instead of re-emitting it, so
+    # the watermark keeps advancing (no freeze) and the dedup set stays bounded.
+    def poll_for(round_index):
+      def poll(unused_element):
+        return PollResult.incomplete(
+            [_ts('f%d' % i, i) for i in range(round_index + 1)])
+
+      return poll
+
+    state = _initial_polling()
+    emitted = collections.Counter()
+    watermarks = []
+    sizes = []
+    for round_index in range(10):
+      tracker = _horizon_tracker(state, poll_for(round_index), horizon=3)
+      holder = ['input', None]
+      tracker.try_claim(holder)
+      for output in holder[1][1]:
+        emitted[output.value] += 1
+      _, state = tracker.try_split(0)
+      watermarks.append(state.poll_watermark)
+      sizes.append(len(state.completed))
+    # Every file emitted exactly once: the aged re-lists are suppressed, not
+    # re-emitted, so there is no duplicate storm.
+    self.assertEqual([1] * 10, [emitted['f%d' % i] for i in range(10)])
+    # The watermark advances to the final round instead of freezing at the
+    # horizon: GC-only (no suppression) would pin it at horizon + 1.
+    self.assertEqual(Timestamp(9), watermarks[-1])
+    # Dedup state is bounded by the horizon window, not the full history.
+    self.assertLessEqual(max(sizes), 5)
+
+  def test_dedup_horizon_reports_suppressed_count(self):
+    # An aged output below the cutoff is suppressed and surfaced as a count so
+    # the DoFn can warn; an on-time output in the same round is still emitted.
+    def poll_for(round_index):
+      def poll(unused_element):
+        if round_index == 0:
+          return PollResult.incomplete([_ts('seed', 100)])
+        return PollResult.incomplete([_ts('aged', 1), _ts('fresh', 101)])
+
+      return poll
+
+    tracker = _horizon_tracker(_initial_polling(), poll_for(0), horizon=5)
+    holder = ['input', None]
+    tracker.try_claim(holder)
+    _, state = tracker.try_split(0)  # watermark now 100, cutoff 95
+
+    resumed = _horizon_tracker(state, poll_for(1), horizon=5)
+    holder = ['input', None]
+    resumed.try_claim(holder)
+    work = holder[1]
+    self.assertEqual(['fresh'], [o.value for o in work[1]])  # aged@1 dropped
+    self.assertEqual(1, work[4])  # one suppression reported
+
 
 # Module-level so the poll function pickles by reference; the call counter is
 # shared within the single in-memory DirectRunner process.
@@ -236,8 +539,45 @@ def _complete_poll(prefix):
   return PollResult.complete([_ts(prefix + 'a', 1), _ts(prefix + 'b', 2)])
 
 
+def _out_of_order_poll(prefix):
+  # Round 1 emits a late_after@10 (advances the watermark to 10); round 2 emits
+  # early@5, which is behind the watermark and therefore late.
+  _POLL_CALLS[prefix] += 1
+  count = _POLL_CALLS[prefix]
+  if count == 1:
+    return PollResult.incomplete([_ts(prefix + 'late_after', 10)])
+  return PollResult.complete([_ts(prefix + 'early', 5)])
+
+
+def _aging_relist_poll(prefix):
+  # Re-lists the whole growing directory every round at the files' original
+  # event times, then completes. With a tight dedup horizon the oldest files
+  # age out and their re-lists must be suppressed, not re-emitted.
+  _POLL_CALLS[prefix] += 1
+  count = _POLL_CALLS[prefix]
+  outputs = [_ts('%s%d' % (prefix, i), i) for i in range(count)]
+  if count >= 5:
+    return PollResult.complete(outputs)
+  return PollResult.incomplete(outputs)
+
+
 def _windowed_group(kv, window=beam.DoFn.WindowParam):
   return ((window.start, window.end), sorted(kv[1]))
+
+
+class WatchBuilderTest(unittest.TestCase):
+  def test_with_dedup_horizon_rejects_negative(self):
+    watch = Watch.growth_of(_complete_poll)
+    with self.assertRaises(ValueError):
+      watch.with_dedup_horizon(-1)
+    with self.assertRaises(ValueError):
+      watch.with_dedup_horizon(Duration(-0.5))
+
+  def test_with_dedup_horizon_accepts_zero_and_duration(self):
+    watch = Watch.growth_of(_complete_poll)
+    self.assertEqual(Duration(0), watch.with_dedup_horizon(0)._dedup_horizon)
+    self.assertEqual(
+        Duration(5), watch.with_dedup_horizon(Duration(5))._dedup_horizon)
 
 
 class WatchEndToEndTest(unittest.TestCase):
@@ -287,6 +627,36 @@ class WatchEndToEndTest(unittest.TestCase):
                     ('y:', 'y:1'), ('y:', 'y:2')]))
     self.assertEqual(3, _POLL_CALLS['x:'])
     self.assertEqual(3, _POLL_CALLS['y:'])
+
+  def test_out_of_order_across_rounds_warns_about_late_output(self):
+    _POLL_CALLS.clear()
+    with self.assertLogs(level='WARNING') as logs:
+      with self._in_memory_pipeline() as p:
+        output = (
+            p | beam.Create(['k:'])
+            | Watch.growth_of(_out_of_order_poll).with_poll_interval(
+                Duration(0.05)))
+        # Watch emits every new output; the lateness is a downstream concern.
+        assert_that(
+            output, equal_to([('k:', 'k:late_after'), ('k:', 'k:early')]))
+    self.assertTrue(
+        any('behind the current watermark' in line for line in logs.output),
+        'expected a late-emission warning, got: %s' % logs.output)
+
+  def test_relisting_with_dedup_horizon_suppresses_and_dedups(self):
+    _POLL_CALLS.clear()
+    with self.assertLogs(level='WARNING') as logs:
+      with self._in_memory_pipeline() as p:
+        output = (
+            p | beam.Create(['k:'])
+            | Watch.growth_of(_aging_relist_poll).with_poll_interval(
+                Duration(0.05)).with_dedup_horizon(Duration(1)))
+        # Each file is emitted exactly once even though every round re-lists the
+        # whole directory: aged re-lists are suppressed, recent ones deduped.
+        assert_that(output, equal_to([('k:', 'k:%d' % i) for i in range(5)]))
+    self.assertTrue(
+        any('more than the dedup horizon' in line for line in logs.output),
+        'expected a suppression warning, got: %s' % logs.output)
 
 
 if __name__ == '__main__':
