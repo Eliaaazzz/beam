@@ -48,6 +48,42 @@ Example::
                       .with_poll_interval(Duration(seconds=5))
                       .with_termination_per_input(after_total_of(60)))
 
+Watermark and event-time contract
+---------------------------------
+Each emitted output carries the event time the poll function reported for it.
+Raw (non-``TimestampedValue``) outputs default to processing time
+(``Timestamp.now()`` at poll), so wrap outputs in ``TimestampedValue`` or pass
+``timestamp=`` to :meth:`PollResult.incomplete`/:meth:`PollResult.complete` when
+the data has a real event time. The watermark for an input is derived per round
+as: (a) the explicit ``with_watermark`` if the poll supplies one; else (b) the
+earliest event time of this round's new outputs; else (c) held unchanged when a
+round yields nothing; and it is released to ``MAX_TIMESTAMP`` on
+:meth:`PollResult.complete`. The watermark only ever advances.
+
+Policy (b) is safe only for poll functions that enumerate outputs in
+non-decreasing event-time order. If a later round returns a brand-new output
+whose event time is *below* the already-advanced watermark, that output is
+emitted at its true (earlier) time and is therefore late: downstream event-time
+windowing may drop it. Watch logs a throttled warning when this happens. For
+out-of-order sources, have the poll supply an explicit watermark via
+:meth:`PollResult.with_watermark` that bounds the earliest event time any future
+output may have. Dedup is by output value identity (a re-seen value keeps its
+first-seen timestamp), and the output coder must be deterministic for dedup to
+hold across workers and restarts.
+
+Scalability
+-----------
+Parallelism is per input element: each input is one restriction watched on one
+worker, with no intra-key splitting (as in the Java ``Watch``), so throughput
+scales with the number of input elements, not with a single input's growth. The
+per-input dedup set retains one hash per distinct output and is not
+garbage-collected by default, so it grows with the number of distinct outputs an
+input ever produces. For high-cardinality, long-lived inputs, bound it with
+:meth:`Watch.with_dedup_horizon` (only for cursor-based or time-windowed polls
+that never re-return an aged-out output; see its docstring), or use a
+cursor-based poll that returns only new outputs. The poll function runs
+synchronously on the watch path, so keep it bounded and timeout-safe.
+
 This API is experimental and may change in backwards-incompatible ways.
 """
 
@@ -113,6 +149,11 @@ class PollResult:
 
   @staticmethod
   def _normalize(outputs, timestamp) -> Tuple[TimestampedValue, ...]:
+    # The default timestamp is computed once per call (not per output) so all
+    # raw outputs in one poll share an event time and the inferred watermark is
+    # not jittered by wall-clock reads. ``timestamp=None`` means "use processing
+    # time"; pass ``timestamp=`` or wrap outputs in ``TimestampedValue`` to set
+    # a real event time.
     if timestamp is None:
       default_ts = Timestamp.now()
     else:
@@ -130,7 +171,10 @@ class PollResult:
     """Reports outputs and expects more; the transform infers the watermark.
 
     A raw (non-:class:`TimestampedValue`) output is stamped with ``timestamp``
-    when given, else with the current processing time.
+    when given, else with the current processing time. With no explicit
+    watermark, the transform holds the watermark at the earliest event time of
+    this poll's new outputs, which is only safe for non-decreasing event-time
+    enumerations; out-of-order sources should call :meth:`with_watermark`.
     """
     return PollResult(PollResult._normalize(outputs, timestamp), watermark=None)
 
@@ -139,12 +183,16 @@ class PollResult:
     """Reports the final outputs for an input, after which polling stops.
 
     A raw (non-:class:`TimestampedValue`) output is stamped with ``timestamp``
-    when given, else with the current processing time.
+    when given, else with the current processing time. The watermark is released
+    to ``MAX_TIMESTAMP`` so downstream event-time windows for this input close.
     """
     return PollResult(
         PollResult._normalize(outputs, timestamp), watermark=MAX_TIMESTAMP)
 
   def with_watermark(self, watermark) -> 'PollResult':
+    """Sets an explicit watermark: a promise that no future output for this
+    input will have an event time below ``watermark``. Use this for sources that
+    can surface outputs out of event-time order across poll rounds."""
     return dataclasses.replace(self, watermark=Timestamp.of(watermark))
 
 
@@ -374,12 +422,14 @@ class _GrowthRestrictionTracker(iobase.RestrictionTracker):
       poll_fn: Callable[[Any], PollResult],
       key_coder: Coder,
       termination: TerminationCondition,
-      now_fn: Callable[[], float]):
+      now_fn: Callable[[], float],
+      dedup_horizon: Optional[Duration] = None):
     self._restriction = restriction
     self._poll_fn = poll_fn
     self._key_coder = key_coder
     self._termination = termination
     self._now = now_fn
+    self._dedup_horizon = dedup_horizon
     self._should_stop = False
     self._primary = None  # type: Optional[_GrowthState]
     self._residual = None  # type: Optional[_GrowthState]
@@ -447,13 +497,12 @@ class _GrowthRestrictionTracker(iobase.RestrictionTracker):
       # initiated or via defer_remainder) resumes a state that emits nothing.
       self._residual = _NonPollingGrowthState(PollResult((), watermark))
     else:
-      merged = collections.OrderedDict(restriction.completed)
-      for key_hash, first_seen in claimed:
-        merged[key_hash] = first_seen
       residual_watermark = self._max_watermark(
           restriction.poll_watermark, watermark)
+      completed = self._build_completed(
+          restriction.completed, claimed, residual_watermark)
       self._residual = _PollingGrowthState(
-          merged, residual_watermark, termination_state)
+          completed, residual_watermark, termination_state)
     holder[1] = ('poll', new_outputs, watermark, stop)
     self._should_stop = True
     return True
@@ -466,6 +515,43 @@ class _GrowthRestrictionTracker(iobase.RestrictionTracker):
     if right is None:
       return left
     return max(left, right)
+
+  def _build_completed(
+      self,
+      base: 'collections.OrderedDict[bytes, Timestamp]',
+      claimed: List[Tuple[bytes, Timestamp]],
+      watermark: Optional[Timestamp],
+  ) -> 'collections.OrderedDict[bytes, Timestamp]':
+    """Builds the residual dedup map.
+
+    Reuses the parent map untouched when a round adds nothing and no dedup
+    horizon is configured, so a steady-state idle round avoids the O(N) copy.
+    Otherwise copies, appends this round's new hashes, and (when a horizon is
+    set) evicts entries whose event time has fallen behind the watermark.
+    """
+    horizon = self._dedup_horizon
+    if not claimed and horizon is None:
+      return base
+    merged = collections.OrderedDict(base)
+    for key_hash, first_seen in claimed:
+      merged[key_hash] = first_seen
+    if horizon is not None and watermark is not None:
+      self._evict_stale(merged, watermark - horizon)
+    return merged
+
+  @staticmethod
+  def _evict_stale(
+      completed: 'collections.OrderedDict[bytes, Timestamp]',
+      cutoff: Timestamp) -> None:
+    # Drop every entry first seen at an event time below the cutoff, regardless
+    # of insertion order. Insertion order is not event-time order in general:
+    # with an explicit held-back watermark a later round can add an
+    # earlier-timestamped output after a future one, so a prefix scan would miss
+    # genuinely-stale entries and fail to bound the state. This full scan is
+    # O(N) in the (horizon-bounded) map size, paid only when a horizon is set.
+    stale = [h for h, first_seen in completed.items() if first_seen < cutoff]
+    for h in stale:
+      del completed[h]
 
   def try_split(self, fraction_of_remainder):
     # Only self-checkpoint (fraction 0) is supported; decline dynamic splits.
@@ -521,14 +607,18 @@ class _WatchGrowthDoFn(core.DoFn, core.RestrictionProvider):
       termination: TerminationCondition,
       poll_interval: Duration,
       output_coder: Coder,
-      now_fn: Optional[Callable[[], float]] = None):
+      now_fn: Optional[Callable[[], float]] = None,
+      dedup_horizon: Optional[Duration] = None):
     self._poll_fn = poll_fn
     self._termination = termination
     self._poll_interval = poll_interval
     self._output_coder = output_coder
     self._key_coder = output_coder
     self._now = now_fn or time.time
+    self._dedup_horizon = dedup_horizon
     self._restriction_coder = _GrowthStateCoder(output_coder, termination)
+    # Count of late emissions seen on this worker, for throttled warnings.
+    self._late_count = 0
 
   def initial_restriction(self, element) -> _PollingGrowthState:
     now = Timestamp.of(self._now())
@@ -543,7 +633,8 @@ class _WatchGrowthDoFn(core.DoFn, core.RestrictionProvider):
         self._poll_fn,
         self._key_coder,
         self._termination,
-        self._now)
+        self._now,
+        self._dedup_horizon)
 
   def split(self, element, restriction):
     # Watch fans out by input element, so each restriction stays whole.
@@ -582,7 +673,14 @@ class _WatchGrowthDoFn(core.DoFn, core.RestrictionProvider):
         yield TimestampedValue((element, output.value), output.timestamp)
       return
     new_outputs, watermark, stop = work[1], work[2], work[3]
+    # Emit outputs first, then advance the watermark (emit-then-advance), so a
+    # round that reports both outputs and a higher watermark cannot push the
+    # watermark past those outputs' event times. An output behind the current
+    # watermark is already late; warn rather than silently dropping it.
+    current_watermark = watermark_estimator.current_watermark()
     for output in new_outputs:
+      if current_watermark is not None and output.timestamp < current_watermark:
+        self._warn_late(element, output.timestamp, current_watermark)
       yield TimestampedValue((element, output.value), output.timestamp)
     if stop:
       # The input is finished, so release the watermark hold to MAX.
@@ -591,6 +689,23 @@ class _WatchGrowthDoFn(core.DoFn, core.RestrictionProvider):
     if watermark is not None:
       _set_watermark_if_greater(watermark_estimator, watermark)
     tracker.defer_remainder(self._poll_interval)
+
+  def _warn_late(self, element, output_timestamp, watermark) -> None:
+    # Throttle to powers of two so an ongoing problem stays visible without
+    # flooding worker logs.
+    self._late_count += 1
+    if self._late_count & (self._late_count - 1) == 0:
+      _LOGGER.warning(
+          'Watch emitted an output for input %r at event time %s, behind the '
+          'current watermark %s, so downstream event-time windowing may drop '
+          'it as late. This happens when the poll returns outputs out of '
+          'event-time order across rounds without an explicit watermark; call '
+          'PollResult.with_watermark(...) for out-of-order sources. '
+          '(%d late emissions so far on this worker)',
+          element,
+          output_timestamp,
+          watermark,
+          self._late_count)
 
 
 def _set_watermark_if_greater(watermark_estimator, new_watermark) -> None:
@@ -617,13 +732,15 @@ class Watch(PTransform):
       termination: Optional[TerminationCondition] = None,
       poll_interval: Optional[Duration] = None,
       output_coder: Optional[Coder] = None,
-      now_fn: Optional[Callable[[], float]] = None):
+      now_fn: Optional[Callable[[], float]] = None,
+      dedup_horizon: Optional[Duration] = None):
     super().__init__()
     self._poll_fn = poll_fn
     self._termination = termination or never()
     self._poll_interval = poll_interval
     self._output_coder = output_coder
     self._now = now_fn
+    self._dedup_horizon = dedup_horizon
 
   @classmethod
   def growth_of(cls, poll_fn: Callable[[Any], PollResult]) -> 'Watch':
@@ -635,7 +752,8 @@ class Watch(PTransform):
         termination=self._termination,
         poll_interval=self._poll_interval,
         output_coder=self._output_coder,
-        now_fn=self._now)
+        now_fn=self._now,
+        dedup_horizon=self._dedup_horizon)
     spec.update(changes)
     return Watch(**spec)
 
@@ -648,6 +766,41 @@ class Watch(PTransform):
 
   def with_output_coder(self, output_coder: Coder) -> 'Watch':
     return self._replace(output_coder=output_coder)
+
+  def with_dedup_horizon(self, horizon) -> 'Watch':
+    """Bounds the per-input dedup state by garbage-collecting output hashes once
+    their event time falls more than ``horizon`` (a :class:`Duration` or
+    seconds) behind the input's watermark.
+
+    By default the dedup set is exact and unbounded: it retains one hash per
+    distinct output forever, so its size grows with the number of distinct
+    outputs an input produces. A horizon caps that footprint (and the per-round
+    copy and per-checkpoint encode that scale with it) to roughly the outputs
+    whose event time is within ``horizon`` of the watermark.
+
+    PRECONDITION (the caller's responsibility): once an output's event time is
+    more than ``horizon`` behind the watermark, the poll must never return that
+    output value again -- at any timestamp. Eviction drops the dedup entry for
+    such an output, so if the poll re-returns the same value later it is treated
+    as new and EMITTED AGAIN. The duplicate is on-time and undetected when the
+    re-seen timestamp is at or after the watermark, so this is stricter than the
+    default late-data hazard: it produces silent duplicates, not just late data.
+
+    This contract holds for time-windowed or cursor-based polls that only
+    enumerate recent outputs (e.g. "list objects modified in the last hour", or
+    a poll that advances a cursor). It does NOT hold for a full-relisting poll
+    that returns the entire collection every round: such a poll re-surfaces
+    evicted outputs and will duplicate them. Leave the horizon unset (the
+    default) for those and rely on the exact unbounded dedup set, or switch to a
+    cursor-based poll.
+
+    ``horizon`` must be non-negative.
+    """
+    horizon = _as_duration(horizon)
+    if horizon < Duration(0):
+      raise ValueError(
+          'dedup horizon must be non-negative, got %s' % (horizon, ))
+    return self._replace(dedup_horizon=horizon)
 
   def expand(self, pcoll):
     if self._poll_interval is None:
@@ -669,7 +822,8 @@ class Watch(PTransform):
             self._termination,
             self._poll_interval,
             output_coder,
-            self._now))
+            self._now,
+            self._dedup_horizon))
 
 
 def _as_duration(value) -> Duration:
