@@ -23,6 +23,7 @@ import unittest
 
 import apache_beam as beam
 from apache_beam.io.watch import after_total_of
+from apache_beam.io.watch_files import ReadFromTextContinuously
 from apache_beam.io.watch_files import WatchForNewFiles
 from apache_beam.io.watch_files import _match_files
 from apache_beam.options.pipeline_options import PipelineOptions
@@ -84,6 +85,56 @@ class WatchForNewFilesTest(unittest.TestCase):
         # Re-globbed every poll round, but the modification-time cursor emits
         # each file exactly once.
         assert_that(names, equal_to(['a.txt', 'b.txt', 'c.txt']))
+
+  def test_mtime_cursor_emits_each_matching_file_once(self):
+    with tempfile.TemporaryDirectory() as directory:
+      pattern = _make_files(
+          directory, [('a.txt', 100), ('b.txt', 101), ('c.txt', 102)])
+      with self._in_memory_pipeline() as p:
+        names = (
+            p
+            | WatchForNewFiles(
+                pattern,
+                interval=0.05,
+                termination=after_total_of(Duration(0.4)),
+                dedup='mtime')
+            | beam.Map(lambda metadata: os.path.basename(metadata.path)))
+        assert_that(names, equal_to(['a.txt', 'b.txt', 'c.txt']))
+
+  def test_mtime_cursor_emits_files_sharing_a_modification_time(self):
+    with tempfile.TemporaryDirectory() as directory:
+      # Three files written at the same coarse modification time still each
+      # emit once under the cursor's same-timestamp cohort.
+      pattern = _make_files(
+          directory, [('a.txt', 100), ('b.txt', 100), ('c.txt', 100)])
+      with self._in_memory_pipeline() as p:
+        names = (
+            p
+            | WatchForNewFiles(
+                pattern,
+                interval=0.05,
+                termination=after_total_of(Duration(0.4)),
+                dedup='mtime')
+            | beam.Map(lambda metadata: os.path.basename(metadata.path)))
+        assert_that(names, equal_to(['a.txt', 'b.txt', 'c.txt']))
+
+  def test_read_lines_of_each_new_file(self):
+    with tempfile.TemporaryDirectory() as directory:
+      for i, (name, mtime) in enumerate([('a.txt', 100), ('b.txt', 101)]):
+        path = os.path.join(directory, name)
+        with open(path, 'w', encoding='utf-8') as handle:
+          handle.write('f%d-line1\nf%d-line2\n' % (i, i))
+        os.utime(path, (mtime, mtime))
+      pattern = os.path.join(directory, '*.txt')
+      with self._in_memory_pipeline() as p:
+        lines = (
+            p
+            | ReadFromTextContinuously(
+                pattern,
+                interval=0.05,
+                termination=after_total_of(Duration(0.4))))
+        assert_that(
+            lines, equal_to(['f0-line1', 'f0-line2', 'f1-line1', 'f1-line2']))
 
 
 if __name__ == '__main__':

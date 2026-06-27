@@ -288,10 +288,8 @@ class _PollingGrowthState:
 
   In the default (hash) mode ``completed`` maps a 16-byte output hash to the
   event time it was first seen; it is insertion-ordered and treated as
-  immutable. In timestamp-cursor mode ``cursor`` holds the greatest event time
-  emitted so far and ``completed`` holds only the hashes emitted at that exact
-  instant (the same-timestamp cohort), so the state stays O(1) for a strictly
-  increasing source.
+  immutable. In timestamp-cursor mode ``completed`` is empty and ``cursor``
+  holds the greatest event time emitted so far, so the state is O(1).
   """
   completed: 'collections.OrderedDict[bytes, Timestamp]'
   poll_watermark: Optional[Timestamp]
@@ -438,15 +436,13 @@ class _GrowthRestrictionTracker(iobase.RestrictionTracker):
       key_coder: Coder,
       termination: TerminationCondition,
       now_fn: Callable[[], float],
-      cursor_mode: bool = False,
-      dedup_key_fn: Optional[Callable[[Any], Any]] = None):
+      cursor_mode: bool = False):
     self._restriction = restriction
     self._poll_fn = poll_fn
     self._key_coder = key_coder
     self._termination = termination
     self._now = now_fn
     self._cursor_mode = cursor_mode
-    self._dedup_key_fn = dedup_key_fn
     self._should_stop = False
     self._primary = None  # type: Optional[_GrowthState]
     self._residual = None  # type: Optional[_GrowthState]
@@ -455,9 +451,8 @@ class _GrowthRestrictionTracker(iobase.RestrictionTracker):
     return self._restriction
 
   def _hash_output(self, value: Any) -> bytes:
-    key = self._dedup_key_fn(value) if self._dedup_key_fn else value
     return hashlib.blake2b(
-        self._key_coder.encode(key), digest_size=_HASH_DIGEST_SIZE).digest()
+        self._key_coder.encode(value), digest_size=_HASH_DIGEST_SIZE).digest()
 
   def try_claim(self, holder: list) -> bool:
     """Performs one poll round (or one replay) and reports it via ``holder``.
@@ -479,29 +474,13 @@ class _GrowthRestrictionTracker(iobase.RestrictionTracker):
 
     claimed = []  # type: List[Tuple[bytes, Timestamp]]
     if self._cursor_mode:
-      # Dedup by a high-water-mark timestamp: drop outputs whose event time is
-      # below the cursor, and at the cursor's own instant keep a bounded set of
-      # the keys already emitted there so files sharing that instant are not
-      # lost. The retained state is the cursor plus that one same-timestamp
-      # cohort, so it stays O(1) for a strictly increasing source.
+      # Dedup by a high-water-mark timestamp: keep only outputs strictly past
+      # the cursor, so the state is one timestamp and the poll is not hashed.
       cursor = restriction.cursor
-      boundary = restriction.completed
-      new_outputs = []  # type: List[TimestampedValue]
-      seen_this_round = set()  # type: set
-      for output in result.outputs:
-        timestamp = output.timestamp
-        if cursor is not None and timestamp < cursor:
-          continue
-        key_hash = self._hash_output(output.value)
-        at_cursor = cursor is not None and timestamp == cursor
-        if at_cursor and key_hash in boundary:
-          continue
-        marker = (timestamp, key_hash)
-        if marker in seen_this_round:
-          continue
-        seen_this_round.add(marker)
-        new_outputs.append(output)
-        claimed.append((key_hash, timestamp))
+      new_outputs = [
+          output for output in result.outputs
+          if cursor is None or output.timestamp > cursor
+      ]
     else:
       # Dedup by value identity against the per-input hash set.
       new_outputs = []  # type: List[TimestampedValue]
@@ -552,9 +531,11 @@ class _GrowthRestrictionTracker(iobase.RestrictionTracker):
     elif self._cursor_mode:
       residual_watermark = self._max_watermark(
           restriction.poll_watermark, watermark)
-      boundary = self._cursor_boundary(restriction, claimed, new_cursor)
       self._residual = _PollingGrowthState(
-          boundary, residual_watermark, termination_state, new_cursor)
+          collections.OrderedDict(),
+          residual_watermark,
+          termination_state,
+          new_cursor)
     else:
       residual_watermark = self._max_watermark(
           restriction.poll_watermark, watermark)
@@ -591,29 +572,6 @@ class _GrowthRestrictionTracker(iobase.RestrictionTracker):
     for key_hash, first_seen in claimed:
       merged[key_hash] = first_seen
     return merged
-
-  @staticmethod
-  def _cursor_boundary(
-      restriction: _GrowthState,
-      claimed: List[Tuple[bytes, Timestamp]],
-      new_cursor: Optional[Timestamp],
-  ) -> 'collections.OrderedDict[bytes, Timestamp]':
-    """Builds the same-timestamp cohort retained at the new cursor.
-
-    Keeps the keys emitted at exactly ``new_cursor`` so a later round skips
-    same-timestamp outputs it already emitted. The prior cohort is carried only
-    when the cursor did not advance; once the cursor moves past an instant its
-    cohort is no longer reachable and is discarded, bounding the state.
-    """
-    boundary = collections.OrderedDict()
-    if new_cursor is None:
-      return boundary
-    if restriction.cursor == new_cursor:
-      boundary.update(restriction.completed)
-    for key_hash, timestamp in claimed:
-      if timestamp == new_cursor:
-        boundary[key_hash] = timestamp
-    return boundary
 
   def try_split(self, fraction_of_remainder):
     # Only self-checkpoint (fraction 0) is supported; decline dynamic splits.
@@ -670,15 +628,12 @@ class _WatchGrowthDoFn(core.DoFn, core.RestrictionProvider):
       poll_interval: Duration,
       output_coder: Coder,
       now_fn: Optional[Callable[[], float]] = None,
-      cursor_mode: bool = False,
-      dedup_key_fn: Optional[Callable[[Any], Any]] = None,
-      dedup_key_coder: Optional[Coder] = None):
+      cursor_mode: bool = False):
     self._poll_fn = poll_fn
     self._termination = termination
     self._poll_interval = poll_interval
     self._output_coder = output_coder
-    self._key_coder = dedup_key_coder or output_coder
-    self._dedup_key_fn = dedup_key_fn
+    self._key_coder = output_coder
     self._now = now_fn or time.time
     self._cursor_mode = cursor_mode
     self._restriction_coder = _GrowthStateCoder(output_coder, termination)
@@ -699,8 +654,7 @@ class _WatchGrowthDoFn(core.DoFn, core.RestrictionProvider):
         self._key_coder,
         self._termination,
         self._now,
-        self._cursor_mode,
-        self._dedup_key_fn)
+        self._cursor_mode)
 
   def split(self, element, restriction):
     # Watch fans out by input element, so each restriction stays whole.
@@ -799,9 +753,7 @@ class Watch(PTransform):
       poll_interval: Optional[Duration] = None,
       output_coder: Optional[Coder] = None,
       now_fn: Optional[Callable[[], float]] = None,
-      cursor_mode: bool = False,
-      dedup_key_fn: Optional[Callable[[Any], Any]] = None,
-      dedup_key_coder: Optional[Coder] = None):
+      cursor_mode: bool = False):
     super().__init__()
     self._poll_fn = poll_fn
     self._termination = termination or never()
@@ -809,8 +761,6 @@ class Watch(PTransform):
     self._output_coder = output_coder
     self._now = now_fn
     self._cursor_mode = cursor_mode
-    self._dedup_key_fn = dedup_key_fn
-    self._dedup_key_coder = dedup_key_coder
 
   @classmethod
   def growth_of(cls, poll_fn: Callable[[Any], PollResult]) -> 'Watch':
@@ -823,9 +773,7 @@ class Watch(PTransform):
         poll_interval=self._poll_interval,
         output_coder=self._output_coder,
         now_fn=self._now,
-        cursor_mode=self._cursor_mode,
-        dedup_key_fn=self._dedup_key_fn,
-        dedup_key_coder=self._dedup_key_coder)
+        cursor_mode=self._cursor_mode)
     spec.update(changes)
     return Watch(**spec)
 
@@ -839,36 +787,26 @@ class Watch(PTransform):
   def with_output_coder(self, output_coder: Coder) -> 'Watch':
     return self._replace(output_coder=output_coder)
 
-  def with_dedup_key(
-      self, key_fn: Callable[[Any], Any], key_coder: Coder) -> 'Watch':
-    """Dedups by ``key_fn(output)`` rather than by the whole output value.
-
-    Two outputs are the same when their extracted keys are equal, so a source
-    that re-lists the same item with a changed payload (for example a file
-    re-listed with a new size) is still emitted once when keyed by a stable
-    identity such as its path. ``key_coder`` encodes the key for hashing and
-    must be deterministic. The output value itself is unchanged.
-    """
-    return self._replace(dedup_key_fn=key_fn, dedup_key_coder=key_coder)
-
   def with_timestamp_cursor(self) -> 'Watch':
     """Dedups by a high-water-mark timestamp instead of by value identity, so
-    the per-input state is bounded regardless of how many outputs are produced.
+    the per-input state is a single timestamp that never grows.
 
-    In this mode Watch keeps the greatest event time it has emitted for an input
-    (the cursor) and, each round, emits the polled outputs whose event time is
-    past the cursor, then advances the cursor to the new maximum. Outputs that
-    share the cursor's exact instant are deduped against a bounded set of the
-    keys already emitted at that instant, so files written within the same tick
-    are each emitted once. The retained state is the cursor plus that one
-    same-timestamp cohort, which is O(1) for a strictly increasing source.
+    In this mode Watch keeps only the greatest event time it has emitted for an
+    input (the cursor) and, each round, emits exactly the polled outputs whose
+    event time is greater than the cursor, then advances the cursor to the new
+    maximum. No hash set is kept and the poll result is not hashed, so the
+    per-input state and the per-checkpoint encoding are O(1) regardless of how
+    many outputs the input produces.
 
-    PRECONDITION: an output's event time must never fall below the high-water
-    mark of an earlier round. An output whose event time is strictly below the
-    cursor is treated as already seen and dropped, so this fits monotonic
-    sources (an ``updated_at`` column or an increasing file modification time)
-    and not sources that surface outputs out of event-time order. Combine with
-    :meth:`with_dedup_key` to dedup same-instant outputs by a stable identity.
+    PRECONDITION: each distinct output must carry an event time strictly greater
+    than every output already emitted for that input (a monotonic cursor, e.g.
+    an ``updated_at`` column or an increasing file modification time). An output
+    whose event time is at or below the cursor is treated as already seen and
+    skipped, so an output re-listed at or below the high-water mark of an
+    earlier round is dropped. Dedup is by timestamp only, not by value, so two
+    outputs sharing an event time within one poll are both emitted if it is
+    past the cursor. For sources that re-list arbitrary collections or surface
+    outputs out of event-time order, use the default exact (hash) dedup instead.
     """
     return self._replace(cursor_mode=True)
 
@@ -880,13 +818,12 @@ class Watch(PTransform):
       hint = self._poll_fn.default_output_coder() if isinstance(
           self._poll_fn, PollFn) else None
       output_coder = hint or coders.PickleCoder()
-    dedup_coder = self._dedup_key_coder or output_coder
-    if not dedup_coder.is_deterministic():
+    if not self._cursor_mode and not output_coder.is_deterministic():
       _LOGGER.warning(
-          'Watch dedup uses a non-deterministic coder (%s); equal outputs may '
-          'be emitted more than once. Pass a deterministic coder via '
-          'with_output_coder() or with_dedup_key().',
-          type(dedup_coder).__name__)
+          'Watch dedup uses a non-deterministic output coder (%s); equal '
+          'outputs may be emitted more than once. Pass a deterministic coder '
+          'via with_output_coder() or switch to with_timestamp_cursor().',
+          type(output_coder).__name__)
     return pcoll | core.ParDo(
         _WatchGrowthDoFn(
             self._poll_fn,
@@ -894,9 +831,7 @@ class Watch(PTransform):
             self._poll_interval,
             output_coder,
             self._now,
-            self._cursor_mode,
-            self._dedup_key_fn,
-            self._dedup_key_coder))
+            self._cursor_mode))
 
 
 def _as_duration(value) -> Duration:

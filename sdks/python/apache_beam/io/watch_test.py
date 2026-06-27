@@ -328,8 +328,8 @@ class GrowthTrackerTest(unittest.TestCase):
     self.assertIs(residual1.completed, residual2.completed)
 
   def test_cursor_keeps_state_o1_and_tracks_high_water_mark(self):
-    # In cursor mode the dedup set stays empty and only the greatest emitted
-    # event time is retained, so the per-input state is O(1).
+    # In cursor mode only the greatest emitted event time is retained, plus the
+    # bounded cohort of keys at that instant, so the per-input state is O(1).
     def poll(unused_element):
       return PollResult.incomplete([_ts('a', 1), _ts('b', 2), _ts('c', 3)])
 
@@ -339,7 +339,8 @@ class GrowthTrackerTest(unittest.TestCase):
     self.assertEqual(['a', 'b', 'c'], [o.value for o in holder[1][1]])
     _, residual = tracker.try_split(0)
     self.assertIsInstance(residual, _PollingGrowthState)
-    self.assertEqual(0, len(residual.completed))  # no hash set
+    self.assertEqual(
+        1, len(residual.completed))  # only the cohort at the cursor
     self.assertEqual(Timestamp(3), residual.cursor)  # high-water mark
 
   def test_cursor_emits_only_outputs_after_the_cursor(self):
@@ -369,7 +370,7 @@ class GrowthTrackerTest(unittest.TestCase):
 
   def test_cursor_relist_emits_each_output_exactly_once(self):
     # A full re-list of a growing collection at strictly increasing event times
-    # emits each output once; the state never accumulates a hash set.
+    # emits each output once; state stays bounded by the same-instant cohort.
     def poll_for(round_index):
       def poll(unused_element):
         return PollResult.incomplete(
@@ -386,9 +387,54 @@ class GrowthTrackerTest(unittest.TestCase):
       for output in holder[1][1]:
         emitted[output.value] += 1
       _, state = tracker.try_split(0)
-      self.assertEqual(0, len(state.completed))  # O(1) throughout
+      self.assertEqual(1, len(state.completed))  # one-element cohort, O(1)
     self.assertEqual([1] * 10, [emitted['f%d' % i] for i in range(10)])
     self.assertEqual(Timestamp(10), state.cursor)
+
+  def test_cursor_emits_distinct_outputs_sharing_one_timestamp(self):
+    # Files written within the same tick share an event time; the cursor keeps a
+    # bounded cohort of the keys at that instant so each is emitted once and a
+    # same-timestamp file re-listed in a later round is not re-emitted.
+    polls = []
+
+    def poll(unused_element):
+      polls.append(len(polls))
+      if len(polls) == 1:
+        return PollResult.incomplete([_ts('a', 5), _ts('b', 5)])
+      return PollResult.incomplete([_ts('a', 5), _ts('b', 5), _ts('c', 5)])
+
+    tracker = _cursor_tracker(_initial_polling(), poll)
+    holder = ['input', None]
+    tracker.try_claim(holder)
+    self.assertEqual(['a', 'b'], sorted(o.value for o in holder[1][1]))
+    _, residual = tracker.try_split(0)
+    self.assertEqual(Timestamp(5), residual.cursor)
+    self.assertEqual(2, len(residual.completed))  # cohort {a, b} at ts 5
+
+    resumed = _cursor_tracker(residual, poll)
+    holder = ['input', None]
+    self.assertTrue(resumed.try_claim(holder))
+    self.assertEqual(['c'], [o.value for o in holder[1][1]])  # only the new one
+    _, residual = resumed.try_split(0)
+    self.assertEqual(3, len(residual.completed))  # cohort grows to {a, b, c}
+
+  def test_dedup_key_collapses_outputs_with_the_same_key(self):
+    # A dedup key function makes outputs sharing an extracted key the same even
+    # when their payloads differ, so the keyed output is emitted once.
+    def poll(unused_element):
+      return PollResult.incomplete(
+          [_ts(('a', 'v1'), 1), _ts(('a', 'v2'), 2), _ts(('b', 'v3'), 3)])
+
+    tracker = _GrowthRestrictionTracker(
+        _initial_polling(),
+        poll,
+        StrUtf8Coder(),
+        never(), lambda: 0.0,
+        dedup_key_fn=lambda value: value[0])
+    holder = ['input', None]
+    tracker.try_claim(holder)
+    self.assertEqual([('a', 'v1'), ('b', 'v3')],
+                     [o.value for o in holder[1][1]])
 
   def test_cursor_complete_stops_and_keeps_o1_state(self):
     def poll(unused_element):
