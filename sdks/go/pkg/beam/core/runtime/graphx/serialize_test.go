@@ -95,6 +95,9 @@ func TestEncodeType(t *testing.T) {
 			M   schema.MicrosInstant
 			Ms  schema.MillisInstant
 			Dec schema.Decimal
+			T3  schema.TimestampMillis
+			T6  schema.TimestampMicros
+			T9  schema.TimestampNanos
 		}{})
 		pbT, err := encodeType(rt)
 		if err != nil {
